@@ -1,0 +1,6 @@
+models:
+  lstm_attention:
+    enabled: true
+    accuracy_target: 0.94
+    inference_time_ms: 2.5
+    memory_mb: 250

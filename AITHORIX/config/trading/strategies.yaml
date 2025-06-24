@@ -1,0 +1,6 @@
+strategies:
+  high_frequency_scalping:
+    enabled: true
+    min_profit_percent: 0.3
+    max_position_size: 0.05
+    timeframes: [1m, 5m]

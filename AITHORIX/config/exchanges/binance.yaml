@@ -1,0 +1,9 @@
+exchange:
+  name: binance
+  api_version: v3
+  endpoints:
+    rest: https://api.binance.com
+    websocket: wss://stream.binance.com:9443
+  rate_limits:
+    requests_per_minute: 1200
+    orders_per_second: 10

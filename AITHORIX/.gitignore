@@ -1,0 +1,15 @@
+# AITHORIX Trading System
+**/keys.yaml
+**/.env
+**/.env.*
+**/credentials
+**/secrets
+**/*.key
+**/*.pem
+**/node_modules/
+**/__pycache__/
+**/*.pyc
+**/.pytest_cache/
+**/logs/
+**/data/
+*/data/.gitkeep

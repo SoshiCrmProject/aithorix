@@ -1,0 +1,9 @@
+permissions:
+  api_access:
+    read: true
+    write: true
+    execute: true
+  trading:
+    spot: true
+    futures: true
+    options: true

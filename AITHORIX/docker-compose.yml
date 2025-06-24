@@ -1,0 +1,11 @@
+version: '3.9'
+services:
+  trading:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - ENVIRONMENT=production
+    volumes:
+      - ./logs:/app/logs
+      - ./data:/app/data
