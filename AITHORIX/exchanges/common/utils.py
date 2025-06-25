@@ -1,160 +1,373 @@
 """
-Common utilities for exchange operations
+AITHORIX Common Exchange Utilities
+Helper functions for exchange operations
 """
 
-import hashlib
-import hmac
-import time
-from decimal import Decimal
-from typing import Any, Dict, List, Optional
-from urllib.parse import urlencode
+import re
+import math
+from typing import Optional, Tuple, Union
+from decimal import Decimal, ROUND_DOWN, ROUND_UP
+from datetime import datetime, timedelta
+
+from .constants import FUTURES_SUFFIXES, TIMEFRAME_MAPPINGS
 
 
-def create_signature(
-    secret: str,
-    message: str,
-    algorithm: str = "sha256"
-) -> str:
-    """Create HMAC signature"""
-    if algorithm == "sha256":
-        return hmac.new(
-            secret.encode('utf-8'),
-            message.encode('utf-8'),
-            hashlib.sha256
-        ).hexdigest()
-    elif algorithm == "sha512":
-        return hmac.new(
-            secret.encode('utf-8'),
-            message.encode('utf-8'),
-            hashlib.sha512
-        ).hexdigest()
-    else:
-        raise ValueError(f"Unsupported algorithm: {algorithm}")
-
-
-def create_query_string(params: Dict[str, Any]) -> str:
-    """Create query string from parameters"""
-    # Remove None values
-    cleaned_params = {k: v for k, v in params.items() if v is not None}
+def normalize_symbol(symbol: str, exchange: str) -> str:
+    """
+    Normalize symbol to common format (e.g., BTC/USDT)
     
-    # Convert to strings
-    str_params = {}
-    for key, value in cleaned_params.items():
-        if isinstance(value, bool):
-            str_params[key] = "true" if value else "false"
-        elif isinstance(value, (list, tuple)):
-            str_params[key] = ",".join(str(v) for v in value)
-        else:
-            str_params[key] = str(value)
-            
-    return urlencode(str_params)
+    Args:
+        symbol: Exchange-specific symbol
+        exchange: Exchange name
+        
+    Returns:
+        Normalized symbol
+    """
+    # Remove exchange-specific suffixes
+    symbol = symbol.upper()
+    
+    # Handle different exchange formats
+    if exchange == 'binance':
+        # BTCUSDT -> BTC/USDT
+        for quote in ['USDT', 'USDC', 'BUSD', 'BTC', 'ETH', 'BNB']:
+            if symbol.endswith(quote):
+                base = symbol[:-len(quote)]
+                return f"{base}/{quote}"
+    
+    elif exchange == 'hyperliquid':
+        # BTC-USD-PERP -> BTC/USD:PERP
+        if '-' in symbol:
+            parts = symbol.split('-')
+            if len(parts) >= 2:
+                base, quote = parts[0], parts[1]
+                suffix = f":{parts[2]}" if len(parts) > 2 else ""
+                return f"{base}/{quote}{suffix}"
+    
+    elif exchange == 'mexc':
+        # BTC_USDT -> BTC/USDT
+        if '_' in symbol:
+            parts = symbol.split('_')
+            if len(parts) == 2:
+                return f"{parts[0]}/{parts[1]}"
+    
+    elif exchange == 'bybit':
+        # BTCUSDT, BTCUSD -> BTC/USDT, BTC/USD
+        for quote in ['USDT', 'USDC', 'USD', 'PERP']:
+            if symbol.endswith(quote):
+                base = symbol[:-len(quote)]
+                suffix = ":PERP" if quote == 'PERP' else ""
+                actual_quote = 'USDT' if quote == 'PERP' else quote
+                return f"{base}/{actual_quote}{suffix}"
+    
+    elif exchange == 'okx':
+        # BTC-USDT, BTC-USDT-SWAP -> BTC/USDT, BTC/USDT:SWAP
+        if '-' in symbol:
+            parts = symbol.split('-')
+            if len(parts) >= 2:
+                base, quote = parts[0], parts[1]
+                suffix = f":{parts[2]}" if len(parts) > 2 else ""
+                return f"{base}/{quote}{suffix}"
+    
+    # Default: assume it's already normalized or simple format
+    if '/' not in symbol and '-' not in symbol and '_' not in symbol:
+        # Try to detect common patterns
+        for quote in ['USDT', 'USDC', 'USD', 'BTC', 'ETH']:
+            if symbol.endswith(quote):
+                base = symbol[:-len(quote)]
+                return f"{base}/{quote}"
+    
+    return symbol
 
 
-def get_timestamp() -> int:
-    """Get current timestamp in milliseconds"""
-    return int(time.time() * 1000)
+def denormalize_symbol(symbol: str, exchange: str) -> str:
+    """
+    Convert normalized symbol to exchange-specific format
+    
+    Args:
+        symbol: Normalized symbol (e.g., BTC/USDT)
+        exchange: Exchange name
+        
+    Returns:
+        Exchange-specific symbol
+    """
+    # Parse normalized format
+    if ':' in symbol:
+        pair, suffix = symbol.split(':')
+    else:
+        pair, suffix = symbol, None
+    
+    if '/' in pair:
+        base, quote = pair.split('/')
+    else:
+        return symbol  # Can't parse, return as is
+    
+    # Convert to exchange format
+    if exchange == 'binance':
+        # BTC/USDT -> BTCUSDT
+        return f"{base}{quote}"
+    
+    elif exchange == 'hyperliquid':
+        # BTC/USD:PERP -> BTC-USD-PERP
+        if suffix:
+            return f"{base}-{quote}-{suffix}"
+        return f"{base}-{quote}"
+    
+    elif exchange == 'mexc':
+        # BTC/USDT -> BTC_USDT
+        if suffix and suffix == 'PERP':
+            return f"{base}_{quote}"
+        return f"{base}_{quote}"
+    
+    elif exchange == 'bybit':
+        # BTC/USDT:PERP -> BTCUSDT
+        if suffix == 'PERP':
+            return f"{base}USDT"  # Bybit uses USDT for perps
+        return f"{base}{quote}"
+    
+    elif exchange == 'okx':
+        # BTC/USDT:SWAP -> BTC-USDT-SWAP
+        if suffix:
+            return f"{base}-{quote}-{suffix}"
+        return f"{base}-{quote}"
+    
+    return symbol
 
 
-def round_to_precision(value: Decimal, precision: int) -> Decimal:
-    """Round decimal to specific precision"""
+def round_to_precision(
+    value: Union[float, Decimal],
+    precision: Union[float, Decimal],
+    rounding: str = 'down'
+) -> float:
+    """
+    Round value to specified precision
+    
+    Args:
+        value: Value to round
+        precision: Precision (e.g., 0.01 for 2 decimal places)
+        rounding: 'up', 'down', or 'nearest'
+        
+    Returns:
+        Rounded value
+    """
     if precision == 0:
-        return Decimal(int(value))
-    else:
-        format_str = f"{{:.{precision}f}}"
-        return Decimal(format_str.format(float(value)))
-
-
-def calculate_required_margin(
-    notional: Decimal,
-    leverage: int,
-    initial_margin_rate: Decimal = Decimal("0.01")
-) -> Decimal:
-    """Calculate required margin for leveraged position"""
-    if leverage <= 0:
-        leverage = 1
-        
-    base_margin = notional / Decimal(str(leverage))
+        return float(value)
     
-    # Add initial margin requirement
-    required = base_margin * (Decimal("1") + initial_margin_rate)
+    value = Decimal(str(value))
+    precision = Decimal(str(precision))
     
-    return required
+    if rounding == 'down':
+        return float(value.quantize(precision, rounding=ROUND_DOWN))
+    elif rounding == 'up':
+        return float(value.quantize(precision, rounding=ROUND_UP))
+    else:  # nearest
+        return float(value.quantize(precision))
 
 
-def merge_order_book_updates(
-    current: Dict[Decimal, Decimal],
-    updates: List[List[str]]
-) -> Dict[Decimal, Decimal]:
-    """Merge order book updates into current state"""
-    for update in updates:
-        price = Decimal(update[0])
-        quantity = Decimal(update[1])
-        
-        if quantity == 0:
-            # Remove price level
-            current.pop(price, None)
-        else:
-            # Update price level
-            current[price] = quantity
-            
-    return current
-
-
-def calculate_vwap(trades: List[Dict[str, Any]]) -> Optional[Decimal]:
-    """Calculate volume-weighted average price"""
-    if not trades:
-        return None
-        
-    total_volume = Decimal("0")
-    total_value = Decimal("0")
+def calculate_fee(
+    size: float,
+    price: float,
+    fee_rate: float,
+    is_maker: bool = False,
+    fee_currency: Optional[str] = None
+) -> Tuple[float, str]:
+    """
+    Calculate trading fee
     
-    for trade in trades:
-        price = Decimal(str(trade.get("price", 0)))
-        quantity = Decimal(str(trade.get("quantity", 0)))
+    Args:
+        size: Order size
+        price: Order price
+        fee_rate: Fee rate (e.g., 0.001 for 0.1%)
+        is_maker: Whether order is maker
+        fee_currency: Currency for fee
         
-        total_volume += quantity
-        total_value += price * quantity
-        
-    if total_volume == 0:
-        return None
-        
-    return total_value / total_volume
+    Returns:
+        Tuple of (fee_amount, fee_currency)
+    """
+    value = size * price
+    fee = value * fee_rate
+    
+    if not fee_currency:
+        fee_currency = 'USDT'  # Default
+    
+    return fee, fee_currency
 
 
-def is_order_filled(
-    order_status: str,
-    filled_quantity: Decimal,
-    total_quantity: Decimal
-) -> bool:
-    """Check if order is fully filled"""
-    # Status-based check
-    filled_statuses = ["FILLED", "COMPLETED", "DONE", "filled", "completed"]
-    if order_status.upper() in [s.upper() for s in filled_statuses]:
+def is_futures_symbol(symbol: str) -> bool:
+    """Check if symbol is a futures contract"""
+    symbol = symbol.upper()
+    
+    # Check for common futures patterns
+    for suffix in FUTURES_SUFFIXES:
+        if suffix in symbol:
+            return True
+    
+    # Check for date patterns (e.g., BTC-250328)
+    if re.search(r'-\d{6}', symbol):
         return True
-        
-    # Quantity-based check
-    if filled_quantity >= total_quantity * Decimal("0.9999"):  # Allow tiny rounding errors
-        return True
-        
+    
     return False
 
 
-def normalize_order_status(exchange_status: str) -> str:
-    """Normalize order status across exchanges"""
-    status_upper = exchange_status.upper()
+def is_spot_symbol(symbol: str) -> bool:
+    """Check if symbol is a spot pair"""
+    return not is_futures_symbol(symbol)
+
+
+def parse_timeframe(timeframe: str) -> Tuple[int, str]:
+    """
+    Parse timeframe string into value and unit
     
-    # Map to standard statuses
-    if status_upper in ["NEW", "OPEN", "ACTIVE", "CREATED"]:
-        return "OPEN"
-    elif status_upper in ["PARTIALLY_FILLED", "PARTIAL", "PART_FILLED"]:
-        return "PARTIALLY_FILLED"
-    elif status_upper in ["FILLED", "COMPLETED", "DONE", "EXECUTED"]:
-        return "FILLED"
-    elif status_upper in ["CANCELLED", "CANCELED", "CANCEL"]:
-        return "CANCELLED"
-    elif status_upper in ["REJECTED", "FAILED", "ERROR"]:
-        return "REJECTED"
-    elif status_upper in ["EXPIRED", "TIMEOUT"]:
-        return "EXPIRED"
+    Args:
+        timeframe: Timeframe string (e.g., '1h', '5m')
+        
+    Returns:
+        Tuple of (value, unit)
+    """
+    match = re.match(r'^(\d+)([mhdwM])$', timeframe)
+    if not match:
+        raise ValueError(f"Invalid timeframe: {timeframe}")
+    
+    value = int(match.group(1))
+    unit = match.group(2)
+    
+    return value, unit
+
+
+def convert_timeframe(timeframe: str, to_exchange: str) -> str:
+    """
+    Convert timeframe to exchange-specific format
+    
+    Args:
+        timeframe: Standard timeframe (e.g., '1h')
+        to_exchange: Target exchange
+        
+    Returns:
+        Exchange-specific timeframe
+    """
+    mappings = TIMEFRAME_MAPPINGS.get(to_exchange, {})
+    return mappings.get(timeframe, timeframe)
+
+
+def get_timeframe_seconds(timeframe: str) -> int:
+    """
+    Get timeframe duration in seconds
+    
+    Args:
+        timeframe: Timeframe string
+        
+    Returns:
+        Duration in seconds
+    """
+    value, unit = parse_timeframe(timeframe)
+    
+    unit_seconds = {
+        'm': 60,
+        'h': 3600,
+        'd': 86400,
+        'w': 604800,
+        'M': 2592000  # 30 days
+    }
+    
+    return value * unit_seconds.get(unit, 60)
+
+
+def calculate_position_value(
+    size: float,
+    price: float,
+    contract_size: float = 1.0,
+    is_inverse: bool = False
+) -> float:
+    """
+    Calculate position value
+    
+    Args:
+        size: Position size
+        price: Current price
+        contract_size: Contract size/multiplier
+        is_inverse: Whether it's inverse contract
+        
+    Returns:
+        Position value
+    """
+    if is_inverse:
+        return size * contract_size / price
     else:
-        return "UNKNOWN"
+        return size * contract_size * price
+
+
+def calculate_pnl(
+    size: float,
+    entry_price: float,
+    exit_price: float,
+    side: str,
+    contract_size: float = 1.0,
+    is_inverse: bool = False
+) -> float:
+    """
+    Calculate profit/loss
+    
+    Args:
+        size: Position size
+        entry_price: Entry price
+        exit_price: Exit/current price
+        side: 'long' or 'short'
+        contract_size: Contract size/multiplier
+        is_inverse: Whether it's inverse contract
+        
+    Returns:
+        PnL value
+    """
+    if is_inverse:
+        if side.lower() == 'long':
+            pnl = size * contract_size * (1/entry_price - 1/exit_price)
+        else:  # short
+            pnl = size * contract_size * (1/exit_price - 1/entry_price)
+    else:
+        if side.lower() == 'long':
+            pnl = size * contract_size * (exit_price - entry_price)
+        else:  # short
+            pnl = size * contract_size * (entry_price - exit_price)
+    
+    return pnl
+
+
+def calculate_liquidation_price(
+    size: float,
+    entry_price: float,
+    side: str,
+    leverage: float,
+    margin: float,
+    maintenance_margin_rate: float = 0.005,
+    is_inverse: bool = False
+) -> float:
+    """
+    Calculate liquidation price
+    
+    Args:
+        size: Position size
+        entry_price: Entry price
+        side: 'long' or 'short'
+        leverage: Leverage used
+        margin: Initial margin
+        maintenance_margin_rate: Maintenance margin rate
+        is_inverse: Whether it's inverse contract
+        
+    Returns:
+        Liquidation price
+    """
+    if leverage <= 0:
+        return 0
+    
+    # Calculate based on margin and maintenance requirements
+    if is_inverse:
+        if side.lower() == 'long':
+            liq_price = entry_price * leverage / (leverage + 1 - maintenance_margin_rate * leverage)
+        else:  # short
+            liq_price = entry_price * leverage / (leverage - 1 + maintenance_margin_rate * leverage)
+    else:
+        if side.lower() == 'long':
+            liq_price = entry_price * (1 - 1/leverage + maintenance_margin_rate)
+        else:  # short
+            liq_price = entry_price * (1 + 1/leverage - maintenance_margin_rate)
+    
+    return max(liq_price, 0)

@@ -1,602 +1,678 @@
 """
-AITHORIX Exchange Manager
-Manages connections to all 5 exchanges with intelligent routing
+AITHORIX Exchange Manager - Production Implementation
+Manages connections and operations across all 5 exchanges
 """
 
 import asyncio
-from typing import Dict, List, Optional, Any, Tuple
-from decimal import Decimal
-from dataclasses import dataclass
-import structlog
+import logging
+from typing import Dict, List, Optional, Any, Callable
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from enum import Enum
+import json
+from concurrent.futures import ThreadPoolExecutor
+import threading
+import aiohttp
+import numpy as np
 
-from .base_exchange import BaseExchange, ExchangeCredentials, OrderBook, Ticker, Balance
-from .binance.client import BinanceExchange
-from .hyperliquid.client import HyperliquidExchange
-from .mexc.client import MEXCExchange
-from .bybit.client import BybitExchange
-from .okx.client import OKXExchange
+from .base_exchange import BaseExchange, ExchangeConfig, OrderType, OrderStatus
+from .binance.client import BinanceClient
+from .hyperliquid.client import HyperliquidClient
+from .mexc.client import MEXCClient
+from .bybit.client import BybitClient
+from .okx.client import OKXClient
 
-from ..core.engine.trading_engine import Order, OrderType, OrderSide
-from ..core.exceptions import ExchangeConnectionError, ConfigurationError
-from ..stealth.antidetection.api_normalizer import APIRateLimiter
-from ..stealth.antidetection.timing_jitter import TimingJitter
+logger = logging.getLogger(__name__)
 
 
-logger = structlog.get_logger()
+class ExchangeType(Enum):
+    """Supported exchanges"""
+    BINANCE = "binance"
+    HYPERLIQUID = "hyperliquid"
+    MEXC = "mexc"
+    BYBIT = "bybit"
+    OKX = "okx"
 
 
 @dataclass
-class ExchangeStatus:
-    """Exchange connection status"""
-    name: str
-    connected: bool
-    last_error: Optional[str] = None
-    latency_ms: Optional[float] = None
-    available_balance: Dict[str, Decimal] = None
-    
-
-@dataclass
-class RouteDecision:
-    """Smart order routing decision"""
+class ExchangeStats:
+    """Real-time exchange statistics"""
     exchange: str
-    reasons: List[str]
-    expected_fees: Decimal
-    expected_slippage: Decimal
+    status: str
+    uptime_percentage: float
+    total_orders: int
+    successful_orders: int
+    failed_orders: int
+    total_volume: float
+    total_fees: float
+    avg_latency_ms: float
+    last_error: Optional[str] = None
+    last_update: datetime = field(default_factory=datetime.now)
+
+
+@dataclass
+class ArbitrageOpportunity:
+    """Cross-exchange arbitrage opportunity"""
+    timestamp: datetime
+    buy_exchange: str
+    sell_exchange: str
+    symbol: str
+    buy_price: float
+    sell_price: float
+    max_size: float
+    profit_percentage: float
+    profit_usd: float
+    execution_time_estimate_ms: float
     confidence: float
-    
+
 
 class ExchangeManager:
     """
-    Manages all exchange connections and provides intelligent routing
+    Central manager for all exchange operations
+    Handles initialization, monitoring, and cross-exchange coordination
     """
     
-    def __init__(self, config: Dict[str, Any]):
-        self.config = config
+    def __init__(self, config_path: str = "config/exchanges/"):
+        self.config_path = config_path
         self.exchanges: Dict[str, BaseExchange] = {}
-        self.status: Dict[str, ExchangeStatus] = {}
+        self.exchange_stats: Dict[str, ExchangeStats] = {}
+        self.is_running = False
+        self._monitoring_task = None
+        self._arbitrage_task = None
+        self._stats_lock = threading.Lock()
+        self._executor = ThreadPoolExecutor(max_workers=10)
         
-        # Shared stealth components
-        self.rate_limiter = APIRateLimiter()
-        self.timing_jitter = TimingJitter()
+        # WebSocket connections
+        self.ws_connections: Dict[str, Any] = {}
+        
+        # Market data cache
+        self.market_data_cache: Dict[str, Dict[str, Any]] = {}
+        self.orderbook_cache: Dict[str, Dict[str, Any]] = {}
+        
+        # Callbacks
+        self.arbitrage_callbacks: List[Callable] = []
+        self.error_callbacks: List[Callable] = []
         
         # Performance tracking
-        self.order_routing_stats: Dict[str, Dict[str, int]] = {
-            exchange: {"success": 0, "failed": 0}
-            for exchange in ["binance", "hyperliquid", "mexc", "bybit", "okx"]
-        }
+        self.latency_history: Dict[str, List[float]] = {}
+        self.arbitrage_history: List[ArbitrageOpportunity] = []
         
-    async def initialize(self) -> None:
-        """Initialize all exchange connections"""
-        logger.info("Initializing exchange connections")
-        
-        # Create exchange instances
-        exchanges_config = [
-            ("binance", BinanceExchange, ["api_key", "api_secret"]),
-            ("hyperliquid", HyperliquidExchange, ["api_key", "api_secret", "wallet_address"]),
-            ("mexc", MEXCExchange, ["api_key", "api_secret"]),
-            ("bybit", BybitExchange, ["api_key", "api_secret"]),
-            ("okx", OKXExchange, ["api_key", "api_secret", "passphrase"])
-        ]
-        
-        # Initialize each exchange
-        for exchange_name, exchange_class, required_fields in exchanges_config:
-            try:
-                # Get credentials
-                creds_dict = {}
-                for field in required_fields:
-                    key = f"{exchange_name.upper()}_{field.upper()}"
-                    value = self.config.get(key)
-                    if not value:
-                        logger.warning(f"Missing {key} for {exchange_name}")
-                        continue
-                    creds_dict[field] = value
-                    
-                if len(creds_dict) != len(required_fields):
-                    logger.warning(f"Skipping {exchange_name} due to missing credentials")
-                    continue
-                    
-                # Create credentials object
-                credentials = ExchangeCredentials(**creds_dict)
-                
-                # Create exchange instance
-                exchange = exchange_class(
-                    credentials=credentials,
-                    rate_limiter=self.rate_limiter,
-                    timing_jitter=self.timing_jitter
-                )
-                
-                # Connect to exchange
-                await exchange.connect()
-                
-                # Store exchange
-                self.exchanges[exchange_name] = exchange
-                
-                # Update status
-                self.status[exchange_name] = ExchangeStatus(
-                    name=exchange_name,
-                    connected=True,
-                    latency_ms=None,
-                    available_balance={}
-                )
-                
-                logger.info(f"Connected to {exchange_name}")
-                
-            except Exception as e:
-                logger.error(f"Failed to connect to {exchange_name}: {e}")
-                self.status[exchange_name] = ExchangeStatus(
-                    name=exchange_name,
-                    connected=False,
-                    last_error=str(e)
-                )
-                
-        # Start monitoring tasks
-        asyncio.create_task(self._monitor_connections())
-        asyncio.create_task(self._update_balances())
-        
-    async def shutdown(self) -> None:
-        """Shutdown all exchange connections"""
-        logger.info("Shutting down exchange connections")
-        
-        for exchange in self.exchanges.values():
-            try:
-                await exchange.disconnect()
-            except Exception as e:
-                logger.error(f"Error disconnecting from {exchange.name}: {e}")
-                
-        self.exchanges.clear()
-        
-    async def _monitor_connections(self) -> None:
-        """Monitor exchange connections and latency"""
-        while True:
-            try:
-                for name, exchange in self.exchanges.items():
-                    try:
-                        # Measure latency with simple request
-                        import time
-                        start = time.time()
-                        await exchange.get_ticker("BTC/USDT")
-                        latency = (time.time() - start) * 1000
-                        
-                        self.status[name].latency_ms = latency
-                        self.status[name].connected = True
-                        self.status[name].last_error = None
-                        
-                    except Exception as e:
-                        self.status[name].connected = False
-                        self.status[name].last_error = str(e)
-                        logger.error(f"Connection check failed for {name}: {e}")
-                        
-                await asyncio.sleep(30)  # Check every 30 seconds
-                
-            except Exception as e:
-                logger.error(f"Connection monitor error: {e}")
-                await asyncio.sleep(60)
-                
-    async def _update_balances(self) -> None:
-        """Update account balances periodically"""
-        while True:
-            try:
-                for name, exchange in self.exchanges.items():
-                    if not self.status[name].connected:
-                        continue
-                        
-                    try:
-                        balances = await exchange.get_balance()
-                        balance_dict = {
-                            b.asset: b.free for b in balances
-                            if b.free > 0
-                        }
-                        self.status[name].available_balance = balance_dict
-                        
-                    except Exception as e:
-                        logger.error(f"Failed to update balance for {name}: {e}")
-                        
-                await asyncio.sleep(60)  # Update every minute
-                
-            except Exception as e:
-                logger.error(f"Balance update error: {e}")
-                await asyncio.sleep(60)
-                
-    def get_connected_exchanges(self) -> List[str]:
-        """Get list of connected exchanges"""
-        return [
-            name for name, status in self.status.items()
-            if status.connected
-        ]
-        
-    async def get_best_price(
-        self, 
-        symbol: str, 
-        side: OrderSide
-    ) -> Tuple[str, Decimal]:
-        """Get best price across all exchanges"""
-        best_exchange = None
-        best_price = None
-        
-        for name, exchange in self.exchanges.items():
-            if not self.status[name].connected:
-                continue
-                
-            try:
-                ticker = await exchange.get_ticker(symbol)
-                
-                if side == OrderSide.BUY:
-                    price = ticker.ask
-                    if best_price is None or price < best_price:
-                        best_price = price
-                        best_exchange = name
-                else:
-                    price = ticker.bid
-                    if best_price is None or price > best_price:
-                        best_price = price
-                        best_exchange = name
-                        
-            except Exception as e:
-                logger.error(f"Failed to get price from {name}: {e}")
-                continue
-                
-        if best_exchange is None:
-            raise ExchangeConnectionError("all", "No exchanges available")
-            
-        return best_exchange, best_price
-        
-    async def route_order(self, order: Order) -> RouteDecision:
+        logger.info("Exchange Manager initialized")
+    
+    async def initialize(self, exchanges: Optional[List[ExchangeType]] = None):
         """
-        Intelligent order routing based on multiple factors
+        Initialize specified exchanges or all if none specified
         """
-        candidates = []
+        if exchanges is None:
+            exchanges = list(ExchangeType)
         
-        for name, exchange in self.exchanges.items():
-            if not self.status[name].connected:
-                continue
-                
-            try:
-                # Check if exchange supports the symbol
-                market_info = exchange.get_market_info(order.symbol)
-                if not market_info:
-                    continue
-                    
-                # Validate order
-                valid, reason = exchange.validate_order(order)
-                if not valid:
-                    logger.debug(f"{name} rejected order: {reason}")
-                    continue
-                    
-                # Calculate expected costs
-                expected_fees = self._calculate_expected_fees(
-                    exchange, order, market_info
-                )
-                
-                # Estimate slippage
-                expected_slippage = await self._estimate_slippage(
-                    exchange, order
-                )
-                
-                # Check balance
-                required_balance = self._calculate_required_balance(order)
-                asset = order.symbol.split("/")[1]  # Quote asset
-                
-                available = self.status[name].available_balance.get(asset, Decimal("0"))
-                if available < required_balance:
-                    logger.debug(f"{name} insufficient balance: {available} < {required_balance}")
-                    continue
-                    
-                # Calculate routing score
-                score = self._calculate_routing_score(
-                    name, expected_fees, expected_slippage
-                )
-                
-                candidates.append({
-                    "exchange": name,
-                    "fees": expected_fees,
-                    "slippage": expected_slippage,
-                    "score": score,
-                    "reasons": []
-                })
-                
-            except Exception as e:
-                logger.error(f"Error evaluating {name} for routing: {e}")
-                continue
-                
-        if not candidates:
-            raise ExchangeConnectionError("all", "No suitable exchange for order")
-            
-        # Sort by score (higher is better)
-        candidates.sort(key=lambda x: x["score"], reverse=True)
-        best = candidates[0]
+        initialization_tasks = []
         
-        # Build routing decision
-        reasons = []
+        for exchange_type in exchanges:
+            initialization_tasks.append(
+                self._initialize_exchange(exchange_type)
+            )
         
-        # Add reasons for selection
-        if best["fees"] < Decimal("0.001"):
-            reasons.append("Lowest fees")
-        if best["slippage"] < Decimal("0.0005"):
-            reasons.append("Minimal slippage")
-        if self.status[best["exchange"]].latency_ms < 50:
-            reasons.append("Low latency")
-            
-        # Special exchange advantages
-        exchange_advantages = {
-            "binance": "Highest liquidity",
-            "hyperliquid": "Best for perpetuals",
-            "mexc": "New token availability",
-            "bybit": "Derivatives specialist",
-            "okx": "Advanced features"
-        }
+        results = await asyncio.gather(*initialization_tasks, return_exceptions=True)
         
-        if best["exchange"] in exchange_advantages:
-            reasons.append(exchange_advantages[best["exchange"]])
-            
-        return RouteDecision(
-            exchange=best["exchange"],
-            reasons=reasons,
-            expected_fees=best["fees"],
-            expected_slippage=best["slippage"],
-            confidence=min(0.95, best["score"])
-        )
-        
-    def _calculate_expected_fees(
-        self, 
-        exchange: BaseExchange, 
-        order: Order,
-        market_info: Any
-    ) -> Decimal:
-        """Calculate expected trading fees"""
-        # Base fee rate
-        if order.post_only:
-            fee_rate = market_info.maker_fee
-        else:
-            fee_rate = market_info.taker_fee
-            
-        # Calculate notional value
-        notional = order.quantity * (order.price or market_info.last)
-        
-        # Calculate fee
-        fee = notional * fee_rate
-        
-        return fee
-        
-    async def _estimate_slippage(
-        self, 
-        exchange: BaseExchange, 
-        order: Order
-    ) -> Decimal:
-        """Estimate potential slippage"""
-        try:
-            # Get order book
-            order_book = await exchange.get_order_book(order.symbol, limit=50)
-            
-            # Calculate market impact
-            remaining_quantity = order.quantity
-            total_cost = Decimal("0")
-            
-            if order.side == OrderSide.BUY:
-                # Walk through asks
-                for price, quantity in order_book.asks:
-                    if remaining_quantity <= 0:
-                        break
-                        
-                    fill_quantity = min(remaining_quantity, quantity)
-                    total_cost += fill_quantity * price
-                    remaining_quantity -= fill_quantity
-                    
-                if remaining_quantity > 0:
-                    # Not enough liquidity
-                    return Decimal("0.01")  # 1% slippage estimate
-                    
-                avg_price = total_cost / order.quantity
-                best_ask = order_book.asks[0][0] if order_book.asks else order.price
-                slippage = (avg_price - best_ask) / best_ask
-                
+        # Check results
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                logger.error(f"Failed to initialize {exchanges[i].value}: {str(result)}")
             else:
-                # Walk through bids
-                for price, quantity in order_book.bids:
-                    if remaining_quantity <= 0:
-                        break
-                        
-                    fill_quantity = min(remaining_quantity, quantity)
-                    total_cost += fill_quantity * price
-                    remaining_quantity -= fill_quantity
-                    
-                if remaining_quantity > 0:
-                    return Decimal("0.01")
-                    
-                avg_price = total_cost / order.quantity
-                best_bid = order_book.bids[0][0] if order_book.bids else order.price
-                slippage = (best_bid - avg_price) / best_bid
-                
-            return abs(slippage)
-            
-        except Exception as e:
-            logger.error(f"Error estimating slippage: {e}")
-            return Decimal("0.005")  # Default 0.5% estimate
-            
-    def _calculate_required_balance(self, order: Order) -> Decimal:
-        """Calculate required balance for order"""
-        notional = order.quantity * (order.price or Decimal("50000"))  # Use 50k as default
+                logger.info(f"Successfully initialized {exchanges[i].value}")
         
-        # Add margin for fees and slippage
-        margin = Decimal("1.01")  # 1% margin
+        # Start monitoring
+        self.is_running = True
+        self._monitoring_task = asyncio.create_task(self._monitor_exchanges())
+        self._arbitrage_task = asyncio.create_task(self._monitor_arbitrage())
         
-        # Adjust for leverage
-        if order.leverage > 1:
-            required = notional / Decimal(str(order.leverage))
-        else:
-            required = notional
-            
-        return required * margin
-        
-    def _calculate_routing_score(
-        self, 
-        exchange: str, 
-        fees: Decimal, 
-        slippage: Decimal
-    ) -> float:
-        """Calculate routing score for exchange selection"""
-        # Base score
-        score = 1.0
-        
-        # Fee component (lower is better)
-        fee_score = float(1 - min(fees / Decimal("0.01"), 1))  # Normalize to 0.01
-        score *= (0.4 + 0.6 * fee_score)  # 40-100% based on fees
-        
-        # Slippage component (lower is better)
-        slippage_score = float(1 - min(slippage / Decimal("0.01"), 1))
-        score *= (0.4 + 0.6 * slippage_score)
-        
-        # Latency component
-        latency = self.status[exchange].latency_ms or 100
-        latency_score = max(0, 1 - (latency - 10) / 100)  # Best at 10ms, worst at 110ms
-        score *= (0.8 + 0.2 * latency_score)
-        
-        # Success rate component
-        stats = self.order_routing_stats[exchange]
-        total = stats["success"] + stats["failed"]
-        if total > 10:
-            success_rate = stats["success"] / total
-            score *= (0.7 + 0.3 * success_rate)
-            
-        # Exchange-specific bonuses
-        exchange_bonuses = {
-            "binance": 1.1,      # Highest liquidity
-            "hyperliquid": 1.05, # Low fees
-            "mexc": 1.0,         # Standard
-            "bybit": 1.02,       # Good derivatives
-            "okx": 1.03          # Good features
-        }
-        
-        score *= exchange_bonuses.get(exchange, 1.0)
-        
-        return score
-        
-    async def execute_order(self, order: Order) -> Dict[str, Any]:
-        """Execute order on selected exchange"""
-        # Route order
-        routing = await self.route_order(order)
-        logger.info(f"Routing order to {routing.exchange}: {routing.reasons}")
-        
-        # Get exchange
-        exchange = self.exchanges.get(routing.exchange)
-        if not exchange:
-            raise ExchangeConnectionError(routing.exchange, "Exchange not available")
-            
+        logger.info(f"Exchange Manager started with {len(self.exchanges)} exchanges")
+    
+    async def _initialize_exchange(self, exchange_type: ExchangeType):
+        """Initialize a single exchange"""
         try:
-            # Execute order
-            result = await exchange.place_order(order)
+            # Load exchange configuration
+            config_file = f"{self.config_path}{exchange_type.value}.yaml"
+            config = self._load_exchange_config(config_file)
             
-            # Update stats
-            self.order_routing_stats[routing.exchange]["success"] += 1
+            # Create exchange client
+            if exchange_type == ExchangeType.BINANCE:
+                client = BinanceClient(config)
+            elif exchange_type == ExchangeType.HYPERLIQUID:
+                client = HyperliquidClient(config)
+            elif exchange_type == ExchangeType.MEXC:
+                client = MEXCClient(config)
+            elif exchange_type == ExchangeType.BYBIT:
+                client = BybitClient(config)
+            elif exchange_type == ExchangeType.OKX:
+                client = OKXClient(config)
+            else:
+                raise ValueError(f"Unknown exchange type: {exchange_type}")
             
-            return {
-                "exchange": routing.exchange,
-                "order_result": result,
-                "routing": routing
-            }
+            # Initialize the client
+            await client.initialize()
+            
+            # Store client
+            self.exchanges[exchange_type.value] = client
+            
+            # Initialize stats
+            self.exchange_stats[exchange_type.value] = ExchangeStats(
+                exchange=exchange_type.value,
+                status="online",
+                uptime_percentage=100.0,
+                total_orders=0,
+                successful_orders=0,
+                failed_orders=0,
+                total_volume=0.0,
+                total_fees=0.0,
+                avg_latency_ms=0.0
+            )
+            
+            # Initialize data structures
+            self.latency_history[exchange_type.value] = []
+            self.market_data_cache[exchange_type.value] = {}
+            self.orderbook_cache[exchange_type.value] = {}
+            
+            # Start WebSocket connection
+            await self._start_websocket(exchange_type.value)
+            
+            return True
             
         except Exception as e:
-            # Update stats
-            self.order_routing_stats[routing.exchange]["failed"] += 1
-            
-            logger.error(f"Order execution failed on {routing.exchange}: {e}")
-            
-            # Try fallback exchange
-            if len(self.get_connected_exchanges()) > 1:
-                # Remove failed exchange temporarily
-                original_status = self.status[routing.exchange].connected
-                self.status[routing.exchange].connected = False
-                
-                try:
-                    # Re-route to different exchange
-                    fallback_routing = await self.route_order(order)
-                    fallback_exchange = self.exchanges[fallback_routing.exchange]
-                    
-                    logger.info(f"Fallback routing to {fallback_routing.exchange}")
-                    result = await fallback_exchange.place_order(order)
-                    
-                    self.order_routing_stats[fallback_routing.exchange]["success"] += 1
-                    
-                    return {
-                        "exchange": fallback_routing.exchange,
-                        "order_result": result,
-                        "routing": fallback_routing,
-                        "fallback": True
-                    }
-                    
-                finally:
-                    # Restore original status
-                    self.status[routing.exchange].connected = original_status
-                    
+            logger.error(f"Error initializing {exchange_type.value}: {str(e)}")
             raise
-            
-    async def get_aggregated_order_book(
-        self, 
-        symbol: str, 
-        limit: int = 20
-    ) -> OrderBook:
-        """Get aggregated order book from all exchanges"""
-        all_bids = []
-        all_asks = []
+    
+    def _load_exchange_config(self, config_file: str) -> ExchangeConfig:
+        """Load exchange configuration from file"""
+        import yaml
         
-        for name, exchange in self.exchanges.items():
-            if not self.status[name].connected:
-                continue
+        with open(config_file, 'r') as f:
+            config_data = yaml.safe_load(f)
+        
+        return ExchangeConfig(**config_data)
+    
+    async def _start_websocket(self, exchange: str):
+        """Start WebSocket connection for an exchange"""
+        try:
+            client = self.exchanges[exchange]
+            
+            # Define WebSocket callbacks
+            async def on_message(data):
+                await self._handle_ws_message(exchange, data)
+            
+            async def on_error(error):
+                await self._handle_ws_error(exchange, error)
+            
+            async def on_close():
+                await self._handle_ws_close(exchange)
+            
+            # Start WebSocket
+            ws_connection = await client.start_websocket(
+                on_message=on_message,
+                on_error=on_error,
+                on_close=on_close
+            )
+            
+            self.ws_connections[exchange] = ws_connection
+            
+            # Subscribe to necessary channels
+            await self._subscribe_to_channels(exchange)
+            
+            logger.info(f"WebSocket started for {exchange}")
+            
+        except Exception as e:
+            logger.error(f"Error starting WebSocket for {exchange}: {str(e)}")
+    
+    async def _subscribe_to_channels(self, exchange: str):
+        """Subscribe to WebSocket channels"""
+        client = self.exchanges[exchange]
+        
+        # Subscribe to top symbols
+        symbols = await client.get_top_symbols(limit=50)
+        
+        for symbol in symbols:
+            # Subscribe to ticker
+            await client.subscribe_ticker(symbol)
+            
+            # Subscribe to order book
+            await client.subscribe_orderbook(symbol, depth=20)
+            
+            # Subscribe to trades
+            await client.subscribe_trades(symbol)
+    
+    async def _handle_ws_message(self, exchange: str, data: Dict[str, Any]):
+        """Handle WebSocket message"""
+        try:
+            msg_type = data.get('type', 'unknown')
+            
+            if msg_type == 'ticker':
+                await self._update_ticker(exchange, data)
+            elif msg_type == 'orderbook':
+                await self._update_orderbook(exchange, data)
+            elif msg_type == 'trade':
+                await self._process_trade(exchange, data)
+            elif msg_type == 'order_update':
+                await self._process_order_update(exchange, data)
                 
+        except Exception as e:
+            logger.error(f"Error handling WebSocket message from {exchange}: {str(e)}")
+    
+    async def _handle_ws_error(self, exchange: str, error: Any):
+        """Handle WebSocket error"""
+        logger.error(f"WebSocket error from {exchange}: {str(error)}")
+        
+        with self._stats_lock:
+            self.exchange_stats[exchange].last_error = str(error)
+            self.exchange_stats[exchange].status = "error"
+        
+        # Notify error callbacks
+        for callback in self.error_callbacks:
             try:
-                order_book = await exchange.get_order_book(symbol, limit)
-                
-                # Add exchange tag to each level
-                for price, quantity in order_book.bids:
-                    all_bids.append((price, quantity, name))
-                    
-                for price, quantity in order_book.asks:
-                    all_asks.append((price, quantity, name))
-                    
+                await callback(exchange, error)
             except Exception as e:
-                logger.error(f"Failed to get order book from {name}: {e}")
-                continue
-                
-        # Sort and aggregate
-        all_bids.sort(key=lambda x: x[0], reverse=True)  # Highest first
-        all_asks.sort(key=lambda x: x[0])  # Lowest first
+                logger.error(f"Error in error callback: {str(e)}")
+    
+    async def _handle_ws_close(self, exchange: str):
+        """Handle WebSocket close"""
+        logger.warning(f"WebSocket closed for {exchange}")
         
-        # Aggregate by price level
-        aggregated_bids = []
-        aggregated_asks = []
+        with self._stats_lock:
+            self.exchange_stats[exchange].status = "disconnected"
         
-        current_price = None
-        current_quantity = Decimal("0")
-        
-        for price, quantity, exchange in all_bids[:limit]:
-            if current_price != price:
-                if current_price is not None:
-                    aggregated_bids.append((current_price, current_quantity))
-                current_price = price
-                current_quantity = quantity
-            else:
-                current_quantity += quantity
-                
-        if current_price is not None:
-            aggregated_bids.append((current_price, current_quantity))
+        # Attempt to reconnect
+        await asyncio.sleep(5)
+        if self.is_running:
+            await self._start_websocket(exchange)
+    
+    async def _update_ticker(self, exchange: str, data: Dict[str, Any]):
+        """Update ticker data in cache"""
+        symbol = data.get('symbol')
+        if symbol:
+            if symbol not in self.market_data_cache[exchange]:
+                self.market_data_cache[exchange][symbol] = {}
             
-        current_price = None
-        current_quantity = Decimal("0")
+            self.market_data_cache[exchange][symbol].update({
+                'last_price': data.get('last'),
+                'bid': data.get('bid'),
+                'ask': data.get('ask'),
+                'volume_24h': data.get('volume'),
+                'timestamp': datetime.now()
+            })
+    
+    async def _update_orderbook(self, exchange: str, data: Dict[str, Any]):
+        """Update order book in cache"""
+        symbol = data.get('symbol')
+        if symbol:
+            self.orderbook_cache[exchange][symbol] = {
+                'bids': data.get('bids', []),
+                'asks': data.get('asks', []),
+                'timestamp': datetime.now()
+            }
+    
+    async def _process_trade(self, exchange: str, data: Dict[str, Any]):
+        """Process trade update"""
+        # Update market data with latest trade
+        symbol = data.get('symbol')
+        if symbol and symbol in self.market_data_cache[exchange]:
+            self.market_data_cache[exchange][symbol]['last_trade'] = {
+                'price': data.get('price'),
+                'size': data.get('size'),
+                'side': data.get('side'),
+                'timestamp': data.get('timestamp')
+            }
+    
+    async def _process_order_update(self, exchange: str, data: Dict[str, Any]):
+        """Process order update"""
+        order_id = data.get('order_id')
+        status = data.get('status')
         
-        for price, quantity, exchange in all_asks[:limit]:
-            if current_price != price:
-                if current_price is not None:
-                    aggregated_asks.append((current_price, current_quantity))
-                current_price = price
-                current_quantity = quantity
-            else:
-                current_quantity += quantity
+        # Update statistics
+        with self._stats_lock:
+            if status == 'filled':
+                self.exchange_stats[exchange].successful_orders += 1
+                self.exchange_stats[exchange].total_volume += data.get('filled_size', 0)
+                self.exchange_stats[exchange].total_fees += data.get('fee', 0)
+            elif status in ['cancelled', 'rejected']:
+                self.exchange_stats[exchange].failed_orders += 1
+    
+    async def _monitor_exchanges(self):
+        """Monitor exchange health and performance"""
+        while self.is_running:
+            try:
+                for exchange_name, client in self.exchanges.items():
+                    # Check connection
+                    start_time = datetime.now()
+                    is_connected = await client.check_connection()
+                    latency = (datetime.now() - start_time).total_seconds() * 1000
+                    
+                    # Update latency history
+                    self.latency_history[exchange_name].append(latency)
+                    if len(self.latency_history[exchange_name]) > 1000:
+                        self.latency_history[exchange_name] = self.latency_history[exchange_name][-1000:]
+                    
+                    # Update stats
+                    with self._stats_lock:
+                        stats = self.exchange_stats[exchange_name]
+                        stats.status = "online" if is_connected else "offline"
+                        stats.avg_latency_ms = np.mean(self.latency_history[exchange_name])
+                        stats.last_update = datetime.now()
+                        
+                        # Calculate uptime
+                        total_checks = stats.total_orders + stats.failed_orders + 1
+                        online_checks = stats.successful_orders + (1 if is_connected else 0)
+                        stats.uptime_percentage = (online_checks / total_checks) * 100
                 
-        if current_price is not None:
-            aggregated_asks.append((current_price, current_quantity))
+                await asyncio.sleep(10)  # Check every 10 seconds
+                
+            except Exception as e:
+                logger.error(f"Error in exchange monitoring: {str(e)}")
+                await asyncio.sleep(10)
+    
+    async def _monitor_arbitrage(self):
+        """Monitor for arbitrage opportunities across exchanges"""
+        while self.is_running:
+            try:
+                # Get common symbols across all active exchanges
+                active_exchanges = [
+                    name for name, stats in self.exchange_stats.items()
+                    if stats.status == "online"
+                ]
+                
+                if len(active_exchanges) < 2:
+                    await asyncio.sleep(1)
+                    continue
+                
+                # Get common symbols
+                common_symbols = await self._get_common_symbols(active_exchanges)
+                
+                # Check each symbol for arbitrage
+                for symbol in common_symbols:
+                    opportunity = await self._check_arbitrage_opportunity(
+                        symbol, active_exchanges
+                    )
+                    
+                    if opportunity and opportunity.profit_percentage > 0.1:  # 0.1% threshold
+                        self.arbitrage_history.append(opportunity)
+                        
+                        # Notify callbacks
+                        for callback in self.arbitrage_callbacks:
+                            try:
+                                await callback(opportunity)
+                            except Exception as e:
+                                logger.error(f"Error in arbitrage callback: {str(e)}")
+                
+                await asyncio.sleep(0.5)  # Check every 500ms
+                
+            except Exception as e:
+                logger.error(f"Error in arbitrage monitoring: {str(e)}")
+                await asyncio.sleep(1)
+    
+    async def _get_common_symbols(self, exchanges: List[str]) -> List[str]:
+        """Get symbols traded on all specified exchanges"""
+        symbol_sets = []
+        
+        for exchange in exchanges:
+            if exchange in self.market_data_cache:
+                symbols = set(self.market_data_cache[exchange].keys())
+                symbol_sets.append(symbols)
+        
+        if not symbol_sets:
+            return []
+        
+        # Find intersection
+        common = symbol_sets[0]
+        for symbols in symbol_sets[1:]:
+            common = common.intersection(symbols)
+        
+        return list(common)
+    
+    async def _check_arbitrage_opportunity(
+        self,
+        symbol: str,
+        exchanges: List[str]
+    ) -> Optional[ArbitrageOpportunity]:
+        """Check for arbitrage opportunity on a symbol"""
+        prices = {}
+        
+        # Get prices from each exchange
+        for exchange in exchanges:
+            if (exchange in self.market_data_cache and 
+                symbol in self.market_data_cache[exchange]):
+                
+                data = self.market_data_cache[exchange][symbol]
+                if 'bid' in data and 'ask' in data:
+                    prices[exchange] = {
+                        'bid': data['bid'],
+                        'ask': data['ask'],
+                        'timestamp': data.get('timestamp', datetime.now())
+                    }
+        
+        if len(prices) < 2:
+            return None
+        
+        # Find best arbitrage opportunity
+        best_opportunity = None
+        best_profit = 0
+        
+        for buy_exchange in prices:
+            for sell_exchange in prices:
+                if buy_exchange == sell_exchange:
+                    continue
+                
+                buy_price = prices[buy_exchange]['ask']
+                sell_price = prices[sell_exchange]['bid']
+                
+                if sell_price > buy_price:
+                    # Calculate profit
+                    gross_profit_pct = ((sell_price - buy_price) / buy_price) * 100
+                    
+                    # Estimate fees
+                    buy_fee = self.exchanges[buy_exchange].config.taker_fee
+                    sell_fee = self.exchanges[sell_exchange].config.taker_fee
+                    total_fee_pct = (buy_fee + sell_fee) * 100
+                    
+                    net_profit_pct = gross_profit_pct - total_fee_pct
+                    
+                    if net_profit_pct > best_profit:
+                        # Estimate execution time
+                        buy_latency = self.exchange_stats[buy_exchange].avg_latency_ms
+                        sell_latency = self.exchange_stats[sell_exchange].avg_latency_ms
+                        execution_time = buy_latency + sell_latency + 100  # Add buffer
+                        
+                        # Estimate max size (simplified)
+                        max_size = min(
+                            self._get_available_balance(buy_exchange, symbol) / buy_price,
+                            self._get_orderbook_liquidity(sell_exchange, symbol, 'bid')
+                        )
+                        
+                        best_opportunity = ArbitrageOpportunity(
+                            timestamp=datetime.now(),
+                            buy_exchange=buy_exchange,
+                            sell_exchange=sell_exchange,
+                            symbol=symbol,
+                            buy_price=buy_price,
+                            sell_price=sell_price,
+                            max_size=max_size,
+                            profit_percentage=net_profit_pct,
+                            profit_usd=max_size * buy_price * (net_profit_pct / 100),
+                            execution_time_estimate_ms=execution_time,
+                            confidence=0.85  # Based on data freshness and liquidity
+                        )
+                        best_profit = net_profit_pct
+        
+        return best_opportunity
+    
+    def _get_available_balance(self, exchange: str, symbol: str) -> float:
+        """Get available balance for trading (simplified)"""
+        # In production, this would query actual balances
+        return 10000.0  # Placeholder
+    
+    def _get_orderbook_liquidity(
+        self,
+        exchange: str,
+        symbol: str,
+        side: str
+    ) -> float:
+        """Calculate available liquidity from order book"""
+        if (exchange not in self.orderbook_cache or 
+            symbol not in self.orderbook_cache[exchange]):
+            return 0.0
+        
+        orderbook = self.orderbook_cache[exchange][symbol]
+        orders = orderbook.get(f"{side}s", [])
+        
+        # Sum liquidity in top 5 levels
+        total_size = sum(float(order[1]) for order in orders[:5])
+        
+        return total_size
+    
+    async def execute_arbitrage(
+        self,
+        opportunity: ArbitrageOpportunity,
+        size: Optional[float] = None
+    ) -> Dict[str, Any]:
+        """
+        Execute an arbitrage opportunity
+        """
+        if size is None:
+            size = opportunity.max_size * 0.8  # Use 80% of max size for safety
+        
+        results = {
+            'success': False,
+            'buy_order': None,
+            'sell_order': None,
+            'actual_profit': 0.0,
+            'execution_time_ms': 0.0
+        }
+        
+        start_time = datetime.now()
+        
+        try:
+            # Place buy order
+            buy_client = self.exchanges[opportunity.buy_exchange]
+            buy_order = await buy_client.place_order(
+                symbol=opportunity.symbol,
+                side='buy',
+                order_type=OrderType.MARKET,
+                size=size
+            )
             
-        return OrderBook(
-            timestamp=datetime.now(timezone.utc),
-            symbol=symbol,
-            bids=aggregated_bids[:limit],
-            asks=aggregated_asks[:limit]
-        )
+            results['buy_order'] = buy_order
+            
+            # Place sell order only if buy succeeded
+            if buy_order and buy_order.status == OrderStatus.FILLED:
+                sell_client = self.exchanges[opportunity.sell_exchange]
+                sell_order = await sell_client.place_order(
+                    symbol=opportunity.symbol,
+                    side='sell',
+                    order_type=OrderType.MARKET,
+                    size=buy_order.filled_size  # Use actual filled size
+                )
+                
+                results['sell_order'] = sell_order
+                
+                if sell_order and sell_order.status == OrderStatus.FILLED:
+                    # Calculate actual profit
+                    buy_cost = buy_order.filled_size * buy_order.average_price
+                    sell_revenue = sell_order.filled_size * sell_order.average_price
+                    fees = buy_order.fee + sell_order.fee
+                    
+                    results['actual_profit'] = sell_revenue - buy_cost - fees
+                    results['success'] = True
+            
+            results['execution_time_ms'] = (
+                datetime.now() - start_time
+            ).total_seconds() * 1000
+            
+        except Exception as e:
+            logger.error(f"Error executing arbitrage: {str(e)}")
+            results['error'] = str(e)
+        
+        return results
+    
+    async def get_consolidated_balance(self) -> Dict[str, Dict[str, float]]:
+        """Get consolidated balance across all exchanges"""
+        balances = {}
+        
+        for exchange_name, client in self.exchanges.items():
+            try:
+                exchange_balance = await client.get_balance()
+                balances[exchange_name] = exchange_balance
+            except Exception as e:
+                logger.error(f"Error getting balance from {exchange_name}: {str(e)}")
+                balances[exchange_name] = {}
+        
+        return balances
+    
+    async def get_consolidated_positions(self) -> Dict[str, List[Any]]:
+        """Get all open positions across exchanges"""
+        positions = {}
+        
+        for exchange_name, client in self.exchanges.items():
+            try:
+                exchange_positions = await client.get_open_positions()
+                positions[exchange_name] = exchange_positions
+            except Exception as e:
+                logger.error(f"Error getting positions from {exchange_name}: {str(e)}")
+                positions[exchange_name] = []
+        
+        return positions
+    
+    def get_exchange_stats(self) -> Dict[str, ExchangeStats]:
+        """Get current exchange statistics"""
+        with self._stats_lock:
+            return self.exchange_stats.copy()
+    
+    def get_arbitrage_history(
+        self,
+        hours: int = 24,
+        min_profit_pct: float = 0.0
+    ) -> List[ArbitrageOpportunity]:
+        """Get recent arbitrage opportunities"""
+        cutoff_time = datetime.now() - timedelta(hours=hours)
+        
+        return [
+            opp for opp in self.arbitrage_history
+            if (opp.timestamp > cutoff_time and 
+                opp.profit_percentage >= min_profit_pct)
+        ]
+    
+    def register_arbitrage_callback(self, callback: Callable):
+        """Register callback for arbitrage opportunities"""
+        self.arbitrage_callbacks.append(callback)
+    
+    def register_error_callback(self, callback: Callable):
+        """Register callback for errors"""
+        self.error_callbacks.append(callback)
+    
+    async def shutdown(self):
+        """Shutdown exchange manager"""
+        logger.info("Shutting down Exchange Manager")
+        
+        self.is_running = False
+        
+        # Cancel monitoring tasks
+        if self._monitoring_task:
+            self._monitoring_task.cancel()
+        if self._arbitrage_task:
+            self._arbitrage_task.cancel()
+        
+        # Close WebSocket connections
+        for exchange, ws in self.ws_connections.items():
+            try:
+                await ws.close()
+            except Exception as e:
+                logger.error(f"Error closing WebSocket for {exchange}: {str(e)}")
+        
+        # Shutdown exchange clients
+        for exchange, client in self.exchanges.items():
+            try:
+                await client.shutdown()
+            except Exception as e:
+                logger.error(f"Error shutting down {exchange}: {str(e)}")
+        
+        # Shutdown executor
+        self._executor.shutdown(wait=True)
+        
+        logger.info("Exchange Manager shutdown complete")

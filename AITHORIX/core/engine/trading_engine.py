@@ -1,657 +1,929 @@
 """
 AITHORIX Trading Engine
-Production-ready core trading system with 175 ML models integration
+Central orchestrator for all trading operations
+
+This is the core component that coordinates all trading activities including:
+- Signal generation and processing
+- Order execution and management
+- Position tracking and risk control
+- Performance monitoring and optimization
 """
 
 import asyncio
 import logging
+from typing import Dict, List, Optional, Any, Tuple, Set
+from datetime import datetime, timedelta
 from decimal import Decimal
-from typing import Dict, List, Optional, Any, Tuple
-from datetime import datetime, timezone
+from collections import defaultdict
 import numpy as np
 from dataclasses import dataclass, field
 from enum import Enum
-import aioredis
-import asyncpg
-from collections import defaultdict
 import json
+import uuid
 
-from ..exceptions import (
-    InsufficientBalanceError, 
-    OrderExecutionError,
-    RiskLimitExceededError,
-    ModelInferenceError
-)
-from ..constants import (
-    MAX_POSITION_SIZE,
-    MAX_LEVERAGE,
-    STOP_LOSS_PERCENT,
-    MIN_TRADE_SIZE_USD,
-    MAX_DAILY_TRADES
-)
+from core.engine.order_manager import OrderManager, Order, OrderStatus, OrderType
+from core.engine.position_manager import PositionManager, Position
+from core.engine.market_data import MarketDataEngine, MarketData
+from core.engine.risk_engine import RiskEngine, RiskMetrics, RiskAlert
+from core.engine.execution_engine import ExecutionEngine, ExecutionReport
+from core.coordinator.strategy_coordinator import StrategyCoordinator, Signal
+from core.coordinator.model_coordinator import ModelCoordinator, ModelPrediction
+from core.coordinator.exchange_coordinator import ExchangeCoordinator
+from utils.helpers import get_timestamp, calculate_returns, format_number
+from monitoring.metrics import MetricsCollector
 
 
-class OrderType(Enum):
-    MARKET = "MARKET"
-    LIMIT = "LIMIT"
-    STOP_LOSS = "STOP_LOSS"
-    TAKE_PROFIT = "TAKE_PROFIT"
-    TRAILING_STOP = "TRAILING_STOP"
+class TradingMode(Enum):
+    """Trading system operational modes"""
+    LIVE = "live"
+    PAPER = "paper"
+    BACKTEST = "backtest"
+    STOPPED = "stopped"
+    EMERGENCY = "emergency"
 
 
-class OrderSide(Enum):
-    BUY = "BUY"
-    SELL = "SELL"
-
-
-class OrderStatus(Enum):
-    PENDING = "PENDING"
-    OPEN = "OPEN"
-    PARTIALLY_FILLED = "PARTIALLY_FILLED"
-    FILLED = "FILLED"
-    CANCELLED = "CANCELLED"
-    REJECTED = "REJECTED"
-    EXPIRED = "EXPIRED"
+class SystemState(Enum):
+    """System state enumeration"""
+    INITIALIZING = "initializing"
+    READY = "ready"
+    RUNNING = "running"
+    PAUSED = "paused"
+    STOPPING = "stopping"
+    STOPPED = "stopped"
+    ERROR = "error"
 
 
 @dataclass
-class TradingSignal:
-    """ML model generated trading signal"""
-    timestamp: datetime
-    symbol: str
-    side: OrderSide
-    confidence: float
-    predicted_price: float
-    predicted_timeframe: int  # minutes
-    model_id: str
-    features: Dict[str, float]
-    risk_score: float
-    
+class TradingSession:
+    """Represents a trading session with performance metrics"""
+    session_id: str
+    start_time: datetime
+    end_time: Optional[datetime] = None
+    mode: TradingMode = TradingMode.LIVE
+    initial_capital: Decimal = Decimal("0")
+    current_capital: Decimal = Decimal("0")
+    total_trades: int = 0
+    winning_trades: int = 0
+    losing_trades: int = 0
+    total_pnl: Decimal = Decimal("0")
+    realized_pnl: Decimal = Decimal("0")
+    unrealized_pnl: Decimal = Decimal("0")
+    max_drawdown: Decimal = Decimal("0")
+    sharpe_ratio: float = 0.0
+    win_rate: float = 0.0
+    daily_returns: List[float] = field(default_factory=list)
+    high_water_mark: Decimal = Decimal("0")
 
-@dataclass
-class Order:
-    """Production order representation"""
-    order_id: str
-    timestamp: datetime
-    symbol: str
-    side: OrderSide
-    order_type: OrderType
-    quantity: Decimal
-    price: Optional[Decimal]
-    status: OrderStatus
-    exchange: str
-    time_in_force: str = "GTC"
-    stop_price: Optional[Decimal] = None
-    take_profit_price: Optional[Decimal] = None
-    leverage: int = 1
-    reduce_only: bool = False
-    post_only: bool = False
-    close_position: bool = False
-    activation_price: Optional[Decimal] = None
-    callback_rate: Optional[Decimal] = None
-    working_type: str = "CONTRACT_PRICE"
-    price_protect: bool = True
-    filled_quantity: Decimal = Decimal("0")
-    average_price: Optional[Decimal] = None
-    commission: Decimal = Decimal("0")
-    commission_asset: Optional[str] = None
-    trades: List[Dict[str, Any]] = field(default_factory=list)
-    
-
-@dataclass
-class Position:
-    """Active position tracking"""
-    position_id: str
-    symbol: str
-    side: OrderSide
-    quantity: Decimal
-    entry_price: Decimal
-    mark_price: Decimal
-    liquidation_price: Optional[Decimal]
-    unrealized_pnl: Decimal
-    realized_pnl: Decimal
-    margin_type: str  # ISOLATED or CROSS
-    leverage: int
-    exchange: str
-    opened_at: datetime
-    updated_at: datetime
-    stop_loss: Optional[Decimal] = None
-    take_profit: Optional[Decimal] = None
-    trailing_stop: Optional[Decimal] = None
-    
 
 class TradingEngine:
     """
-    Core trading engine orchestrating all trading operations
-    Manages 175 ML models, 5 exchanges, risk management, and execution
+    Central trading engine that orchestrates all trading operations
+    
+    This engine coordinates between various components to execute trading strategies
+    while maintaining strict risk controls and behavioral stealth patterns.
     """
     
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(
+        self,
+        config: Dict[str, Any],
+        market_data_engine: MarketDataEngine,
+        risk_engine: RiskEngine,
+        execution_engine: ExecutionEngine,
+        strategy_coordinator: StrategyCoordinator,
+        model_coordinator: ModelCoordinator,
+        exchange_coordinator: ExchangeCoordinator
+    ):
         self.config = config
-        self.logger = self._setup_logger()
+        self.logger = logging.getLogger("AITHORIX.TradingEngine")
         
-        # Core components (will be initialized in startup)
-        self.db_pool: Optional[asyncpg.Pool] = None
-        self.redis_pool: Optional[aioredis.Redis] = None
+        # Core components
+        self.market_data_engine = market_data_engine
+        self.risk_engine = risk_engine
+        self.execution_engine = execution_engine
+        self.strategy_coordinator = strategy_coordinator
+        self.model_coordinator = model_coordinator
+        self.exchange_coordinator = exchange_coordinator
         
-        # Trading state
-        self.active_orders: Dict[str, Order] = {}
-        self.positions: Dict[str, Position] = {}
-        self.daily_trades_count: Dict[str, int] = defaultdict(int)
-        self.model_performance: Dict[str, Dict[str, float]] = defaultdict(dict)
+        # Managers
+        self.order_manager = OrderManager(config.get("order_manager", {}))
+        self.position_manager = PositionManager(config.get("position_manager", {}))
         
-        # Risk limits
-        self.max_position_size = Decimal(str(config.get("max_position_size", MAX_POSITION_SIZE)))
-        self.max_leverage = config.get("max_leverage", MAX_LEVERAGE)
-        self.stop_loss_percent = Decimal(str(config.get("stop_loss_percent", STOP_LOSS_PERCENT)))
-        self.max_daily_trades = config.get("max_daily_trades", MAX_DAILY_TRADES)
+        # State management
+        self.state = SystemState.INITIALIZING
+        self.mode = TradingMode(config.get("mode", "live"))
+        self.dry_run = config.get("dry_run", False)
+        
+        # Trading session
+        self.current_session: Optional[TradingSession] = None
+        self.session_history: List[TradingSession] = []
         
         # Performance tracking
-        self.daily_pnl = Decimal("0")
-        self.total_volume = Decimal("0")
-        self.win_rate = 0.0
-        self.sharpe_ratio = 0.0
+        self.metrics_collector = MetricsCollector()
+        self.performance_buffer: List[Dict[str, Any]] = []
+        self.daily_pnl: defaultdict = defaultdict(Decimal)
         
-        # Engine state
-        self.is_running = False
+        # Control flags
+        self.accept_new_trades = True
         self.emergency_stop = False
+        self.max_daily_trades = config.get("max_daily_trades", 1200)
+        self.max_concurrent_positions = config.get("max_concurrent_positions", 50)
         
-    def _setup_logger(self) -> logging.Logger:
-        """Configure production logging"""
-        logger = logging.getLogger("aithorix.trading_engine")
-        logger.setLevel(logging.INFO)
+        # Behavioral patterns
+        self.behavioral_config = config.get("behavioral", {})
+        self.last_trade_time = datetime.utcnow()
+        self.trade_frequency_buffer: List[datetime] = []
         
-        # JSON formatter for structured logging
-        handler = logging.StreamHandler()
-        formatter = logging.Formatter(
-            '{"timestamp": "%(asctime)s", "level": "%(levelname)s", '
-            '"module": "%(name)s", "message": "%(message)s"}'
-        )
-        handler.setFormatter(formatter)
-        logger.addHandler(handler)
+        # Tasks and event management
+        self.tasks: Set[asyncio.Task] = set()
+        self.shutdown_event = asyncio.Event()
         
-        return logger
+        # Performance targets
+        self.daily_return_target = Decimal(str(config.get("daily_return_target", "0.20")))
+        self.max_drawdown_limit = Decimal(str(config.get("max_drawdown_limit", "0.02")))
         
-    async def startup(self):
-        """Initialize all engine components"""
-        self.logger.info("Starting AITHORIX Trading Engine")
+    async def initialize(self) -> None:
+        """Initialize the trading engine and all components"""
+        self.logger.info("Initializing Trading Engine...")
         
         try:
-            # Initialize database connections
-            self.db_pool = await asyncpg.create_pool(
-                self.config["database_url"],
-                min_size=10,
-                max_size=20,
-                command_timeout=60
-            )
+            # Initialize managers
+            await self.order_manager.initialize()
+            await self.position_manager.initialize()
             
-            # Initialize Redis for real-time data
-            self.redis_pool = await aioredis.create_redis_pool(
-                self.config["redis_url"],
-                minsize=5,
-                maxsize=10
-            )
+            # Subscribe to market data
+            await self._setup_market_data_subscriptions()
             
-            # Load existing positions
-            await self._load_positions()
+            # Setup risk monitoring
+            await self._setup_risk_monitoring()
             
-            # Initialize model ensemble
-            await self._initialize_models()
+            # Initialize trading session
+            self._initialize_session()
             
-            # Start background tasks
-            asyncio.create_task(self._risk_monitor())
-            asyncio.create_task(self._performance_tracker())
-            asyncio.create_task(self._order_manager())
+            # Load previous session data if exists
+            await self._load_session_history()
             
-            self.is_running = True
-            self.logger.info("Trading Engine started successfully")
+            self.state = SystemState.READY
+            self.logger.info("Trading Engine initialization complete")
             
         except Exception as e:
-            self.logger.error(f"Failed to start Trading Engine: {e}")
+            self.logger.error(f"Failed to initialize trading engine: {e}", exc_info=True)
+            self.state = SystemState.ERROR
             raise
-            
-    async def shutdown(self):
-        """Gracefully shutdown the engine"""
-        self.logger.info("Shutting down Trading Engine")
-        self.is_running = False
+    
+    async def start(self) -> None:
+        """Start the trading engine"""
+        if self.state != SystemState.READY:
+            raise RuntimeError(f"Cannot start engine in state: {self.state}")
         
-        # Cancel all pending orders
-        for order_id in list(self.active_orders.keys()):
-            await self.cancel_order(order_id)
-            
-        # Close database connections
-        if self.db_pool:
-            await self.db_pool.close()
-        if self.redis_pool:
-            self.redis_pool.close()
-            await self.redis_pool.wait_closed()
-            
-        self.logger.info("Trading Engine shutdown complete")
+        self.logger.info("Starting Trading Engine...")
+        self.state = SystemState.RUNNING
         
-    async def process_signal(self, signal: TradingSignal) -> Optional[Order]:
-        """
-        Process trading signal from ML models
-        Implements full validation, risk checks, and execution
-        """
-        if self.emergency_stop:
-            self.logger.warning("Emergency stop active, rejecting signal")
-            return None
-            
         try:
-            # Validate signal
-            if not await self._validate_signal(signal):
-                return None
+            # Start component tasks
+            self.tasks.add(asyncio.create_task(self._trading_loop()))
+            self.tasks.add(asyncio.create_task(self._risk_monitoring_loop()))
+            self.tasks.add(asyncio.create_task(self._performance_tracking_loop()))
+            self.tasks.add(asyncio.create_task(self._behavioral_simulation_loop()))
+            self.tasks.add(asyncio.create_task(self._order_management_loop()))
+            
+            # Start session
+            if self.current_session:
+                self.current_session.start_time = datetime.utcnow()
+            
+            self.logger.info(f"Trading Engine started in {self.mode.value} mode")
+            
+        except Exception as e:
+            self.logger.error(f"Failed to start trading engine: {e}", exc_info=True)
+            self.state = SystemState.ERROR
+            raise
+    
+    async def stop(self) -> None:
+        """Stop the trading engine gracefully"""
+        self.logger.info("Stopping Trading Engine...")
+        self.state = SystemState.STOPPING
+        
+        # Signal shutdown
+        self.shutdown_event.set()
+        
+        # Cancel all tasks
+        for task in self.tasks:
+            if not task.done():
+                task.cancel()
+        
+        # Wait for tasks to complete
+        if self.tasks:
+            await asyncio.gather(*self.tasks, return_exceptions=True)
+        
+        # Save session data
+        await self._save_session_data()
+        
+        # End current session
+        if self.current_session:
+            self.current_session.end_time = datetime.utcnow()
+            self.session_history.append(self.current_session)
+        
+        self.state = SystemState.STOPPED
+        self.logger.info("Trading Engine stopped")
+    
+    async def _trading_loop(self) -> None:
+        """Main trading loop that processes signals and executes trades"""
+        self.logger.info("Starting trading loop...")
+        
+        while not self.shutdown_event.is_set():
+            try:
+                if not self.accept_new_trades or self.emergency_stop:
+                    await asyncio.sleep(1)
+                    continue
                 
-            # Risk checks
-            risk_check = await self._check_risk_limits(signal)
-            if not risk_check["passed"]:
-                self.logger.warning(f"Risk check failed: {risk_check['reason']}")
-                return None
+                # Get current market state
+                market_state = await self._get_market_state()
                 
+                # Check if we should trade (behavioral simulation)
+                if not await self._should_trade_now():
+                    await asyncio.sleep(0.1)
+                    continue
+                
+                # Get model predictions
+                predictions = await self.model_coordinator.get_predictions(market_state)
+                
+                # Generate trading signals
+                signals = await self.strategy_coordinator.generate_signals(
+                    market_state, predictions
+                )
+                
+                # Filter signals through risk checks
+                validated_signals = await self._validate_signals(signals)
+                
+                # Execute trades for validated signals
+                for signal in validated_signals:
+                    await self._process_signal(signal)
+                
+                # Small delay to prevent excessive CPU usage
+                await asyncio.sleep(0.05)  # 50ms = 20 checks per second
+                
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.logger.error(f"Error in trading loop: {e}", exc_info=True)
+                await asyncio.sleep(1)
+    
+    async def _process_signal(self, signal: Signal) -> None:
+        """Process a trading signal and create orders"""
+        try:
+            # Check position limits
+            current_positions = len(self.position_manager.get_open_positions())
+            if current_positions >= self.max_concurrent_positions:
+                self.logger.warning(f"Max positions reached ({current_positions}), skipping signal")
+                return
+            
             # Calculate position size
             position_size = await self._calculate_position_size(signal)
-            if position_size < MIN_TRADE_SIZE_USD:
-                self.logger.info(f"Position size {position_size} below minimum")
-                return None
-                
+            if position_size <= 0:
+                return
+            
             # Create order
             order = await self._create_order_from_signal(signal, position_size)
             
-            # Execute order
-            executed_order = await self._execute_order(order)
+            # Submit order for execution
+            if self.dry_run:
+                self.logger.info(f"DRY RUN: Would execute order: {order}")
+                await self._simulate_order_execution(order)
+            else:
+                execution_report = await self.execution_engine.execute_order(order)
+                await self._handle_execution_report(execution_report)
             
-            # Update model performance
-            await self._update_model_performance(signal.model_id, executed_order)
-            
-            return executed_order
+            # Update metrics
+            self.metrics_collector.record_signal_processed(signal)
             
         except Exception as e:
-            self.logger.error(f"Error processing signal: {e}")
-            await self._record_error("signal_processing", str(e), signal)
-            return None
-            
-    async def _validate_signal(self, signal: TradingSignal) -> bool:
-        """Comprehensive signal validation"""
-        # Check confidence threshold
-        if signal.confidence < 0.85:  # 85% minimum confidence
-            return False
-            
-        # Check if we already have a position in this symbol
-        existing_position = self.positions.get(signal.symbol)
-        if existing_position:
-            # Allow adding to winning positions only
-            if existing_position.unrealized_pnl < 0:
-                return False
-                
-        # Check daily trade limit
-        if self.daily_trades_count[signal.symbol] >= self.max_daily_trades:
-            return False
-            
-        # Validate against market conditions
-        market_valid = await self._validate_market_conditions(signal.symbol)
-        if not market_valid:
-            return False
-            
-        return True
+            self.logger.error(f"Error processing signal: {e}", exc_info=True)
+            self.metrics_collector.record_error("signal_processing", str(e))
+    
+    async def _risk_monitoring_loop(self) -> None:
+        """Continuous risk monitoring loop"""
+        self.logger.info("Starting risk monitoring loop...")
         
-    async def _check_risk_limits(self, signal: TradingSignal) -> Dict[str, Any]:
-        """Comprehensive risk management checks"""
-        checks = {
-            "passed": True,
-            "reason": None,
-            "risk_score": 0.0
-        }
-        
-        # Portfolio concentration check
-        total_exposure = sum(
-            pos.quantity * pos.mark_price 
-            for pos in self.positions.values()
-        )
-        
-        if total_exposure > self.max_position_size * Decimal("100"):
-            checks["passed"] = False
-            checks["reason"] = "Portfolio concentration limit exceeded"
-            return checks
-            
-        # Correlation check
-        correlation_risk = await self._calculate_correlation_risk(signal.symbol)
-        if correlation_risk > 0.7:
-            checks["passed"] = False
-            checks["reason"] = f"High correlation risk: {correlation_risk}"
-            return checks
-            
-        # Drawdown check
-        current_drawdown = await self._calculate_current_drawdown()
-        if current_drawdown > Decimal("0.015"):  # 1.5% drawdown limit
-            checks["passed"] = False
-            checks["reason"] = f"Drawdown limit exceeded: {current_drawdown}"
-            return checks
-            
-        # Volatility check
-        volatility = await self._get_current_volatility(signal.symbol)
-        if volatility > 0.05:  # 5% volatility threshold
-            checks["risk_score"] = 0.8
-            
-        checks["risk_score"] = signal.risk_score
-        return checks
-        
-    async def _calculate_position_size(self, signal: TradingSignal) -> Decimal:
-        """
-        Kelly Criterion based position sizing with ML enhancement
-        """
-        # Get account balance
-        account_balance = await self._get_account_balance(signal.symbol.split("/")[1])
-        
-        # Base position size (Kelly Criterion)
-        win_probability = signal.confidence
-        win_loss_ratio = 1.5  # Target 1.5:1 risk/reward
-        
-        kelly_fraction = (win_probability * win_loss_ratio - (1 - win_probability)) / win_loss_ratio
-        kelly_fraction = max(0, min(kelly_fraction, 0.25))  # Cap at 25%
-        
-        # Adjust for volatility
-        volatility_multiplier = 1.0
-        current_volatility = await self._get_current_volatility(signal.symbol)
-        if current_volatility > 0.03:
-            volatility_multiplier = 0.5
-            
-        # Adjust for correlation
-        correlation_multiplier = 1.0
-        correlation_risk = await self._calculate_correlation_risk(signal.symbol)
-        if correlation_risk > 0.5:
-            correlation_multiplier = 0.7
-            
-        # Calculate final position size
-        position_size = (
-            account_balance * 
-            Decimal(str(kelly_fraction)) * 
-            Decimal(str(volatility_multiplier)) * 
-            Decimal(str(correlation_multiplier))
-        )
-        
-        # Apply maximum position size limit
-        max_size = account_balance * self.max_position_size
-        position_size = min(position_size, max_size)
-        
-        return position_size
-        
-    async def _create_order_from_signal(
-        self, 
-        signal: TradingSignal, 
-        position_size: Decimal
-    ) -> Order:
-        """Create order with all safety features"""
-        # Calculate quantity based on current price
-        current_price = await self._get_current_price(signal.symbol)
-        quantity = position_size / current_price
-        
-        # Round to exchange precision
-        quantity = await self._round_to_precision(signal.symbol, quantity)
-        
-        # Calculate stop loss and take profit
-        stop_loss_price = None
-        take_profit_price = None
-        
-        if signal.side == OrderSide.BUY:
-            stop_loss_price = current_price * (Decimal("1") - self.stop_loss_percent)
-            take_profit_price = current_price * Decimal("1.03")  # 3% take profit
-        else:
-            stop_loss_price = current_price * (Decimal("1") + self.stop_loss_percent)
-            take_profit_price = current_price * Decimal("0.97")
-            
-        # Determine best exchange for execution
-        best_exchange = await self._select_best_exchange(signal.symbol, quantity)
-        
-        # Create order
-        order = Order(
-            order_id=self._generate_order_id(),
-            timestamp=datetime.now(timezone.utc),
-            symbol=signal.symbol,
-            side=signal.side,
-            order_type=OrderType.LIMIT,
-            quantity=quantity,
-            price=current_price,
-            status=OrderStatus.PENDING,
-            exchange=best_exchange,
-            leverage=min(self.max_leverage, 10),  # Conservative leverage
-            stop_price=stop_loss_price,
-            take_profit_price=take_profit_price,
-            post_only=True,  # Maker only for lower fees
-            price_protect=True
-        )
-        
-        return order
-        
-    async def _execute_order(self, order: Order) -> Order:
-        """Execute order with retry logic and error handling"""
-        max_retries = 3
-        retry_count = 0
-        
-        while retry_count < max_retries:
+        while not self.shutdown_event.is_set():
             try:
-                # Update order status
-                order.status = OrderStatus.OPEN
-                self.active_orders[order.order_id] = order
+                # Get current risk metrics
+                risk_metrics = await self.risk_engine.calculate_risk_metrics(
+                    self.position_manager.get_all_positions(),
+                    self.order_manager.get_open_orders()
+                )
                 
-                # Send to exchange
-                exchange_response = await self._send_order_to_exchange(order)
+                # Check for risk breaches
+                risk_alerts = await self.risk_engine.check_risk_limits(risk_metrics)
                 
-                # Update order with exchange data
-                order.exchange_order_id = exchange_response["id"]
-                order.status = OrderStatus.OPEN
+                # Handle risk alerts
+                for alert in risk_alerts:
+                    await self._handle_risk_alert(alert)
                 
-                # Record order in database
-                await self._record_order(order)
+                # Update risk dashboard
+                self.metrics_collector.update_risk_metrics(risk_metrics)
                 
-                # Increment daily trade count
-                self.daily_trades_count[order.symbol] += 1
+                # Check for emergency conditions
+                if await self._check_emergency_conditions(risk_metrics):
+                    await self._trigger_emergency_stop()
                 
-                # Start order monitoring
-                asyncio.create_task(self._monitor_order(order))
-                
-                self.logger.info(f"Order executed: {order.order_id}")
-                return order
-                
-            except Exception as e:
-                retry_count += 1
-                self.logger.error(f"Order execution failed (attempt {retry_count}): {e}")
-                
-                if retry_count >= max_retries:
-                    order.status = OrderStatus.REJECTED
-                    await self._record_order_failure(order, str(e))
-                    raise OrderExecutionError(f"Failed to execute order after {max_retries} attempts")
-                    
-                await asyncio.sleep(0.5 * retry_count)  # Exponential backoff
-                
-    async def _monitor_order(self, order: Order):
-        """Monitor order execution and manage position"""
-        while order.status in [OrderStatus.OPEN, OrderStatus.PARTIALLY_FILLED]:
-            try:
-                # Check order status
-                status = await self._check_order_status(order)
-                
-                if status["status"] == "FILLED":
-                    order.status = OrderStatus.FILLED
-                    order.filled_quantity = Decimal(str(status["filled_quantity"]))
-                    order.average_price = Decimal(str(status["average_price"]))
-                    
-                    # Create or update position
-                    await self._update_position(order)
-                    
-                    # Place stop loss and take profit orders
-                    if order.stop_price:
-                        await self._place_stop_loss(order)
-                    if order.take_profit_price:
-                        await self._place_take_profit(order)
-                        
-                elif status["status"] == "CANCELLED":
-                    order.status = OrderStatus.CANCELLED
-                    
-                elif status["status"] == "EXPIRED":
-                    order.status = OrderStatus.EXPIRED
-                    
-                # Update database
-                await self._update_order_status(order)
-                
-                if order.status not in [OrderStatus.OPEN, OrderStatus.PARTIALLY_FILLED]:
-                    break
-                    
                 await asyncio.sleep(1)  # Check every second
                 
+            except asyncio.CancelledError:
+                break
             except Exception as e:
-                self.logger.error(f"Error monitoring order {order.order_id}: {e}")
-                await asyncio.sleep(5)
-                
-    async def _risk_monitor(self):
-        """Continuous risk monitoring task"""
-        while self.is_running:
+                self.logger.error(f"Error in risk monitoring: {e}", exc_info=True)
+                await asyncio.sleep(1)
+    
+    async def _performance_tracking_loop(self) -> None:
+        """Track and analyze trading performance"""
+        self.logger.info("Starting performance tracking loop...")
+        
+        while not self.shutdown_event.is_set():
             try:
-                # Check portfolio risk metrics
-                portfolio_risk = await self._calculate_portfolio_risk()
+                # Calculate current performance
+                performance = await self._calculate_performance()
                 
-                # Check drawdown
-                current_drawdown = await self._calculate_current_drawdown()
-                if current_drawdown > Decimal("0.02"):  # 2% emergency threshold
-                    self.logger.critical(f"Emergency stop triggered: drawdown {current_drawdown}")
-                    self.emergency_stop = True
-                    await self._emergency_close_all_positions()
-                    
-                # Check correlation risk
-                correlation_matrix = await self._calculate_correlation_matrix()
-                max_correlation = np.max(np.abs(correlation_matrix - np.eye(len(correlation_matrix))))
-                if max_correlation > 0.8:
-                    self.logger.warning(f"High correlation detected: {max_correlation}")
-                    
-                # Check position limits
-                for symbol, position in self.positions.items():
-                    position_value = position.quantity * position.mark_price
-                    account_balance = await self._get_account_balance()
-                    
-                    if position_value > account_balance * self.max_position_size:
-                        self.logger.warning(f"Position limit exceeded for {symbol}")
-                        await self._reduce_position(position, 0.5)  # Reduce by 50%
-                        
-                # Update risk metrics in Redis
-                await self._update_risk_metrics(portfolio_risk)
+                # Update session metrics
+                if self.current_session:
+                    self._update_session_metrics(performance)
                 
-                await asyncio.sleep(5)  # Check every 5 seconds
+                # Check daily targets
+                await self._check_daily_targets(performance)
                 
+                # Record performance metrics
+                self.metrics_collector.record_performance(performance)
+                
+                # Save performance snapshot
+                self.performance_buffer.append({
+                    "timestamp": get_timestamp(),
+                    "performance": performance
+                })
+                
+                # Trim buffer if too large
+                if len(self.performance_buffer) > 1000:
+                    self.performance_buffer = self.performance_buffer[-500:]
+                
+                await asyncio.sleep(10)  # Update every 10 seconds
+                
+            except asyncio.CancelledError:
+                break
             except Exception as e:
-                self.logger.error(f"Risk monitor error: {e}")
+                self.logger.error(f"Error in performance tracking: {e}", exc_info=True)
                 await asyncio.sleep(10)
-                
-    async def _performance_tracker(self):
-        """Track and optimize performance metrics"""
-        while self.is_running:
+    
+    async def _behavioral_simulation_loop(self) -> None:
+        """Simulate human behavioral patterns"""
+        self.logger.info("Starting behavioral simulation loop...")
+        
+        while not self.shutdown_event.is_set():
             try:
-                # Calculate performance metrics
-                metrics = await self._calculate_performance_metrics()
+                # Simulate human-like trading patterns
+                await self._simulate_trading_breaks()
+                await self._simulate_fatigue_patterns()
+                await self._simulate_emotional_responses()
                 
-                # Update Sharpe ratio
-                self.sharpe_ratio = metrics["sharpe_ratio"]
+                # Add random delays to actions
+                await self._add_behavioral_delays()
                 
-                # Update win rate
-                self.win_rate = metrics["win_rate"]
+                # Update behavioral state
+                await self._update_behavioral_state()
                 
-                # Check if we're meeting targets
-                if self.daily_pnl < Decimal(str(self.config["target_daily_return"])):
-                    self.logger.info(f"Below daily target: {self.daily_pnl}")
-                    
-                # Model performance analysis
-                for model_id, performance in self.model_performance.items():
-                    if performance.get("accuracy", 0) < 0.85:
-                        self.logger.warning(f"Model {model_id} underperforming: {performance}")
-                        
-                # Record metrics
-                await self._record_performance_metrics(metrics)
+                await asyncio.sleep(60)  # Check every minute
                 
-                await asyncio.sleep(60)  # Update every minute
-                
+            except asyncio.CancelledError:
+                break
             except Exception as e:
-                self.logger.error(f"Performance tracker error: {e}")
+                self.logger.error(f"Error in behavioral simulation: {e}", exc_info=True)
                 await asyncio.sleep(60)
+    
+    async def _order_management_loop(self) -> None:
+        """Manage order lifecycle and updates"""
+        self.logger.info("Starting order management loop...")
+        
+        while not self.shutdown_event.is_set():
+            try:
+                # Update order statuses
+                await self.order_manager.update_order_statuses()
                 
-    async def _get_current_price(self, symbol: str) -> Decimal:
-        """Get current market price from Redis cache"""
-        price_key = f"price:{symbol}"
-        price = await self.redis_pool.get(price_key)
-        
-        if not price:
-            # Fallback to database
-            async with self.db_pool.acquire() as conn:
-                result = await conn.fetchone(
-                    "SELECT price FROM market_data WHERE symbol = $1 ORDER BY timestamp DESC LIMIT 1",
-                    symbol
+                # Check for filled orders
+                filled_orders = self.order_manager.get_filled_orders()
+                for order in filled_orders:
+                    await self._handle_filled_order(order)
+                
+                # Check for expired orders
+                expired_orders = self.order_manager.get_expired_orders()
+                for order in expired_orders:
+                    await self._handle_expired_order(order)
+                
+                # Update positions from executions
+                await self.position_manager.update_from_executions(
+                    self.execution_engine.get_recent_executions()
                 )
-                price = result["price"] if result else Decimal("0")
-        else:
-            price = Decimal(price.decode())
-            
-        return price
-        
-    async def _get_account_balance(self, asset: str = "USDT") -> Decimal:
-        """Get current account balance"""
-        balance_key = f"balance:{asset}"
-        balance = await self.redis_pool.get(balance_key)
-        
-        if not balance:
-            # Fallback to database
-            async with self.db_pool.acquire() as conn:
-                result = await conn.fetchone(
-                    "SELECT balance FROM account_balances WHERE asset = $1",
-                    asset
-                )
-                balance = result["balance"] if result else Decimal("0")
-        else:
-            balance = Decimal(balance.decode())
-            
-        return balance
-        
-    async def _calculate_portfolio_risk(self) -> Dict[str, float]:
-        """Calculate comprehensive portfolio risk metrics"""
-        positions_data = []
-        
-        for position in self.positions.values():
-            positions_data.append({
-                "symbol": position.symbol,
-                "value": float(position.quantity * position.mark_price),
-                "pnl": float(position.unrealized_pnl),
-                "leverage": position.leverage
-            })
-            
-        if not positions_data:
-            return {"var": 0.0, "cvar": 0.0, "max_drawdown": 0.0}
-            
-        # Calculate Value at Risk (VaR)
-        values = np.array([p["value"] for p in positions_data])
-        returns = np.array([p["pnl"] / p["value"] if p["value"] > 0 else 0 for p in positions_data])
-        
-        var_95 = np.percentile(returns, 5)
-        cvar_95 = np.mean(returns[returns <= var_95]) if len(returns[returns <= var_95]) > 0 else var_95
+                
+                await asyncio.sleep(0.1)  # Check every 100ms
+                
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.logger.error(f"Error in order management: {e}", exc_info=True)
+                await asyncio.sleep(1)
+    
+    async def _get_market_state(self) -> Dict[str, Any]:
+        """Get current market state from all sources"""
+        market_data = await self.market_data_engine.get_latest_data()
         
         return {
-            "var": float(var_95),
-            "cvar": float(cvar_95),
-            "total_exposure": float(np.sum(values)),
-            "position_count": len(positions_data),
-            "average_leverage": float(np.mean([p["leverage"] for p in positions_data]))
+            "timestamp": get_timestamp(),
+            "market_data": market_data,
+            "positions": self.position_manager.get_open_positions(),
+            "open_orders": self.order_manager.get_open_orders(),
+            "account_balance": await self._get_account_balance(),
+            "market_conditions": await self._analyze_market_conditions(market_data)
         }
+    
+    async def _should_trade_now(self) -> bool:
+        """Determine if we should trade based on behavioral patterns"""
+        # Check session time limits
+        session_duration = datetime.utcnow() - self.current_session.start_time
+        if session_duration > timedelta(hours=8):
+            # Simulate fatigue after 8 hours
+            if np.random.random() > 0.3:  # 70% chance to skip
+                return False
         
-    def _generate_order_id(self) -> str:
-        """Generate unique order ID"""
-        import uuid
-        return f"ORD-{datetime.now().strftime('%Y%m%d')}-{str(uuid.uuid4())[:8]}"
+        # Check trade frequency
+        recent_trades = len([
+            t for t in self.trade_frequency_buffer 
+            if t > datetime.utcnow() - timedelta(minutes=5)
+        ])
         
-    async def _record_order(self, order: Order):
-        """Record order in database"""
-        async with self.db_pool.acquire() as conn:
-            await conn.execute("""
-                INSERT INTO orders (
-                    order_id, timestamp, symbol, side, order_type,
-                    quantity, price, status, exchange, leverage
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-            """, 
-                order.order_id, order.timestamp, order.symbol, order.side.value,
-                order.order_type.value, order.quantity, order.price,
-                order.status.value, order.exchange, order.leverage
+        if recent_trades > 20:  # Too many trades in 5 minutes
+            return False
+        
+        # Add human-like randomness
+        if np.random.random() < 0.02:  # 2% chance to randomly skip
+            return False
+        
+        return True
+    
+    async def _validate_signals(self, signals: List[Signal]) -> List[Signal]:
+        """Validate signals through risk and compliance checks"""
+        validated = []
+        
+        for signal in signals:
+            # Risk checks
+            risk_approved = await self.risk_engine.approve_signal(signal)
+            if not risk_approved:
+                self.logger.debug(f"Signal rejected by risk engine: {signal}")
+                continue
+            
+            # Position limit checks
+            if len(self.position_manager.get_open_positions()) >= self.max_concurrent_positions:
+                self.logger.debug(f"Signal rejected due to position limits: {signal}")
+                continue
+            
+            # Daily trade limit checks
+            if self.current_session.total_trades >= self.max_daily_trades:
+                self.logger.debug(f"Signal rejected due to daily trade limit: {signal}")
+                continue
+            
+            validated.append(signal)
+        
+        return validated
+    
+    async def _calculate_position_size(self, signal: Signal) -> Decimal:
+        """Calculate position size using Kelly Criterion and risk management"""
+        # Get account balance
+        balance = await self._get_account_balance()
+        
+        # Get signal confidence and expected return
+        confidence = signal.confidence
+        expected_return = signal.expected_return
+        
+        # Apply Kelly Criterion with safety factor
+        kelly_fraction = (confidence * expected_return) / signal.risk
+        safety_factor = Decimal("0.25")  # Use 25% of Kelly size for safety
+        position_fraction = min(kelly_fraction * safety_factor, Decimal("0.05"))  # Max 5% per trade
+        
+        # Calculate position size
+        position_size = balance * position_fraction
+        
+        # Apply minimum and maximum constraints
+        min_size = Decimal(str(self.config.get("min_position_size", "100")))
+        max_size = Decimal(str(self.config.get("max_position_size", "10000")))
+        
+        position_size = max(min(position_size, max_size), min_size)
+        
+        # Round to appropriate precision
+        return position_size.quantize(Decimal("0.01"))
+    
+    async def _create_order_from_signal(self, signal: Signal, size: Decimal) -> Order:
+        """Create an order from a trading signal"""
+        # Add human-like randomness to order creation
+        await asyncio.sleep(np.random.uniform(0.5, 2.0))  # Random delay
+        
+        # Create order with slight price randomization
+        price = signal.entry_price
+        if signal.order_type == OrderType.LIMIT:
+            # Add small random offset to limit price
+            offset = Decimal(str(np.random.uniform(-0.0001, 0.0001)))
+            price = price * (Decimal("1") + offset)
+        
+        order = Order(
+            order_id=str(uuid.uuid4()),
+            symbol=signal.symbol,
+            exchange=signal.exchange,
+            side=signal.side,
+            order_type=signal.order_type,
+            quantity=size,
+            price=price,
+            time_in_force=signal.time_in_force,
+            strategy_id=signal.strategy_id,
+            signal_id=signal.signal_id,
+            metadata={
+                "confidence": str(signal.confidence),
+                "expected_return": str(signal.expected_return),
+                "stop_loss": str(signal.stop_loss),
+                "take_profit": str(signal.take_profit)
+            }
+        )
+        
+        # Add to order manager
+        await self.order_manager.add_order(order)
+        
+        return order
+    
+    async def _handle_execution_report(self, report: ExecutionReport) -> None:
+        """Handle execution report from execution engine"""
+        # Update order status
+        await self.order_manager.update_order_from_execution(report)
+        
+        # Create or update position if filled
+        if report.status == OrderStatus.FILLED:
+            await self.position_manager.create_or_update_position(report)
+            
+            # Update session metrics
+            if self.current_session:
+                self.current_session.total_trades += 1
+            
+            # Record trade time for behavioral patterns
+            self.last_trade_time = datetime.utcnow()
+            self.trade_frequency_buffer.append(self.last_trade_time)
+            
+            # Trim buffer
+            cutoff_time = datetime.utcnow() - timedelta(hours=1)
+            self.trade_frequency_buffer = [
+                t for t in self.trade_frequency_buffer if t > cutoff_time
+            ]
+    
+    async def _handle_risk_alert(self, alert: RiskAlert) -> None:
+        """Handle risk alerts from risk engine"""
+        self.logger.warning(f"Risk Alert: {alert}")
+        
+        if alert.severity == "CRITICAL":
+            # Reduce position sizes
+            self.logger.warning("Critical risk alert - reducing position sizes")
+            await self._reduce_risk_exposure()
+            
+        elif alert.severity == "HIGH":
+            # Stop new trades temporarily
+            self.logger.warning("High risk alert - pausing new trades")
+            self.accept_new_trades = False
+            
+            # Resume after cooldown
+            asyncio.create_task(self._resume_trading_after_delay(300))  # 5 minutes
+    
+    async def _reduce_risk_exposure(self) -> None:
+        """Reduce risk exposure by closing or reducing positions"""
+        positions = self.position_manager.get_open_positions()
+        
+        # Sort by loss (close losing positions first)
+        positions.sort(key=lambda p: p.unrealized_pnl)
+        
+        # Close worst 20% of positions
+        positions_to_close = positions[:len(positions) // 5]
+        
+        for position in positions_to_close:
+            await self._close_position(position, "Risk reduction")
+    
+    async def _close_position(self, position: Position, reason: str) -> None:
+        """Close a position"""
+        self.logger.info(f"Closing position {position.position_id} - Reason: {reason}")
+        
+        # Create closing order
+        order = Order(
+            order_id=str(uuid.uuid4()),
+            symbol=position.symbol,
+            exchange=position.exchange,
+            side="SELL" if position.side == "BUY" else "BUY",
+            order_type=OrderType.MARKET,
+            quantity=position.quantity,
+            metadata={"reason": reason, "position_id": position.position_id}
+        )
+        
+        # Execute closing order
+        if not self.dry_run:
+            await self.execution_engine.execute_order(order)
+        else:
+            await self._simulate_order_execution(order)
+    
+    async def _check_emergency_conditions(self, risk_metrics: RiskMetrics) -> bool:
+        """Check for emergency conditions that require immediate action"""
+        # Check for excessive drawdown
+        if risk_metrics.current_drawdown > self.max_drawdown_limit:
+            self.logger.critical(f"Max drawdown exceeded: {risk_metrics.current_drawdown}")
+            return True
+        
+        # Check for systematic errors
+        error_rate = self.metrics_collector.get_error_rate(minutes=5)
+        if error_rate > 0.1:  # More than 10% error rate
+            self.logger.critical(f"High error rate detected: {error_rate}")
+            return True
+        
+        # Check for connectivity issues
+        if not await self.exchange_coordinator.check_connectivity():
+            self.logger.critical("Exchange connectivity lost")
+            return True
+        
+        return False
+    
+    async def _trigger_emergency_stop(self) -> None:
+        """Trigger emergency stop and close all positions"""
+        self.logger.critical("EMERGENCY STOP TRIGGERED")
+        self.emergency_stop = True
+        self.accept_new_trades = False
+        
+        # Cancel all open orders
+        open_orders = self.order_manager.get_open_orders()
+        for order in open_orders:
+            await self.order_manager.cancel_order(order.order_id)
+        
+        # Close all positions
+        await self.close_all_positions()
+        
+        # Send emergency notification
+        await self._send_emergency_notification()
+    
+    async def close_all_positions(self) -> None:
+        """Close all open positions immediately"""
+        self.logger.warning("Closing all positions...")
+        
+        positions = self.position_manager.get_open_positions()
+        close_tasks = []
+        
+        for position in positions:
+            task = asyncio.create_task(
+                self._close_position(position, "Emergency close")
             )
+            close_tasks.append(task)
+        
+        if close_tasks:
+            await asyncio.gather(*close_tasks, return_exceptions=True)
+        
+        self.logger.info(f"Closed {len(positions)} positions")
+    
+    async def stop_new_trades(self) -> None:
+        """Stop accepting new trades"""
+        self.logger.info("Stopping new trades...")
+        self.accept_new_trades = False
+    
+    def get_status(self) -> Dict[str, Any]:
+        """Get current engine status"""
+        return {
+            "state": self.state.value,
+            "mode": self.mode.value,
+            "accepting_trades": self.accept_new_trades,
+            "emergency_stop": self.emergency_stop,
+            "session": {
+                "id": self.current_session.session_id if self.current_session else None,
+                "duration": str(datetime.utcnow() - self.current_session.start_time) if self.current_session else None,
+                "total_trades": self.current_session.total_trades if self.current_session else 0,
+                "pnl": float(self.current_session.total_pnl) if self.current_session else 0
+            },
+            "positions": {
+                "open": len(self.position_manager.get_open_positions()),
+                "total_value": float(self.position_manager.get_total_position_value())
+            },
+            "orders": {
+                "open": len(self.order_manager.get_open_orders()),
+                "pending": len(self.order_manager.get_pending_orders())
+            }
+        }
+    
+    # Helper methods
+    
+    def _initialize_session(self) -> None:
+        """Initialize a new trading session"""
+        self.current_session = TradingSession(
+            session_id=str(uuid.uuid4()),
+            start_time=datetime.utcnow(),
+            mode=self.mode,
+            initial_capital=Decimal(str(self.config.get("initial_capital", "10000")))
+        )
+        self.current_session.current_capital = self.current_session.initial_capital
+        self.current_session.high_water_mark = self.current_session.initial_capital
+    
+    async def _load_session_history(self) -> None:
+        """Load previous trading session history"""
+        # Implementation would load from database
+        pass
+    
+    async def _save_session_data(self) -> None:
+        """Save current session data"""
+        # Implementation would save to database
+        pass
+    
+    async def _get_account_balance(self) -> Decimal:
+        """Get total account balance across all exchanges"""
+        total_balance = Decimal("0")
+        
+        for exchange in self.exchange_coordinator.get_connected_exchanges():
+            balance = await exchange.get_balance()
+            total_balance += balance
+        
+        return total_balance
+    
+    async def _analyze_market_conditions(self, market_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Analyze current market conditions"""
+        # Implementation would analyze volatility, trends, etc.
+        return {
+            "volatility": "normal",
+            "trend": "neutral",
+            "volume": "average"
+        }
+    
+    async def _calculate_performance(self) -> Dict[str, Any]:
+        """Calculate current performance metrics"""
+        positions = self.position_manager.get_all_positions()
+        
+        # Calculate P&L
+        realized_pnl = sum(p.realized_pnl for p in positions if p.is_closed)
+        unrealized_pnl = sum(p.unrealized_pnl for p in positions if not p.is_closed)
+        total_pnl = realized_pnl + unrealized_pnl
+        
+        # Calculate returns
+        if self.current_session:
+            returns = float(total_pnl / self.current_session.initial_capital)
+            daily_return = returns  # Simplified for now
+        else:
+            returns = 0.0
+            daily_return = 0.0
+        
+        return {
+            "realized_pnl": float(realized_pnl),
+            "unrealized_pnl": float(unrealized_pnl),
+            "total_pnl": float(total_pnl),
+            "returns": returns,
+            "daily_return": daily_return,
+            "positions": len([p for p in positions if not p.is_closed]),
+            "trades_today": self.current_session.total_trades if self.current_session else 0
+        }
+    
+    def _update_session_metrics(self, performance: Dict[str, Any]) -> None:
+        """Update current session with performance metrics"""
+        if not self.current_session:
+            return
+        
+        self.current_session.total_pnl = Decimal(str(performance["total_pnl"]))
+        self.current_session.realized_pnl = Decimal(str(performance["realized_pnl"]))
+        self.current_session.unrealized_pnl = Decimal(str(performance["unrealized_pnl"]))
+        
+        # Update capital
+        self.current_session.current_capital = (
+            self.current_session.initial_capital + self.current_session.total_pnl
+        )
+        
+        # Update high water mark
+        if self.current_session.current_capital > self.current_session.high_water_mark:
+            self.current_session.high_water_mark = self.current_session.current_capital
+        
+        # Calculate drawdown
+        drawdown = (
+            (self.current_session.high_water_mark - self.current_session.current_capital) /
+            self.current_session.high_water_mark
+        )
+        
+        if drawdown > self.current_session.max_drawdown:
+            self.current_session.max_drawdown = drawdown
+        
+        # Update win rate
+        if self.current_session.total_trades > 0:
+            self.current_session.win_rate = (
+                self.current_session.winning_trades / self.current_session.total_trades
+            )
+    
+    async def _check_daily_targets(self, performance: Dict[str, Any]) -> None:
+        """Check if daily targets are being met"""
+        daily_return = Decimal(str(performance["daily_return"]))
+        
+        if daily_return >= self.daily_return_target:
+            self.logger.info(f"Daily target achieved: {daily_return:.2%}")
+            # Could implement logic to reduce risk after target achieved
+        
+        elif daily_return < -self.max_drawdown_limit:
+            self.logger.warning(f"Daily loss limit approaching: {daily_return:.2%}")
+            # Reduce position sizes or stop trading
+            self.accept_new_trades = False
+            asyncio.create_task(self._resume_trading_after_delay(3600))  # 1 hour
+    
+    async def _simulate_order_execution(self, order: Order) -> None:
+        """Simulate order execution for dry run mode"""
+        # Simulate execution with slight delay
+        await asyncio.sleep(np.random.uniform(0.1, 0.5))
+        
+        # Create simulated execution report
+        report = ExecutionReport(
+            order_id=order.order_id,
+            execution_id=str(uuid.uuid4()),
+            status=OrderStatus.FILLED,
+            filled_quantity=order.quantity,
+            average_price=order.price or await self._get_current_price(order.symbol),
+            timestamp=datetime.utcnow()
+        )
+        
+        await self._handle_execution_report(report)
+    
+    async def _get_current_price(self, symbol: str) -> Decimal:
+        """Get current market price for a symbol"""
+        market_data = await self.market_data_engine.get_latest_data()
+        return Decimal(str(market_data.get(symbol, {}).get("price", "0")))
+    
+    async def _simulate_trading_breaks(self) -> None:
+        """Simulate human-like trading breaks"""
+        session_duration = datetime.utcnow() - self.current_session.start_time
+        
+        # Take break every 2-3 hours
+        if session_duration.total_seconds() % (2.5 * 3600) < 60:
+            break_duration = np.random.uniform(300, 900)  # 5-15 minutes
+            self.logger.info(f"Taking trading break for {break_duration/60:.1f} minutes")
+            self.accept_new_trades = False
+            await asyncio.sleep(break_duration)
+            self.accept_new_trades = True
+    
+    async def _simulate_fatigue_patterns(self) -> None:
+        """Simulate fatigue affecting trading performance"""
+        session_duration = datetime.utcnow() - self.current_session.start_time
+        
+        if session_duration > timedelta(hours=6):
+            # Reduce trading frequency when "tired"
+            self.max_concurrent_positions = int(self.max_concurrent_positions * 0.8)
+    
+    async def _simulate_emotional_responses(self) -> None:
+        """Simulate emotional responses to P&L"""
+        if not self.current_session:
+            return
+        
+        # React to losses
+        if self.current_session.total_pnl < 0:
+            loss_percent = abs(float(self.current_session.total_pnl / self.current_session.initial_capital))
+            if loss_percent > 0.01:  # More than 1% loss
+                # Reduce risk taking
+                self.logger.info("Reducing risk due to losses")
+                # Implementation would adjust position sizing
+    
+    async def _add_behavioral_delays(self) -> None:
+        """Add random delays to simulate human behavior"""
+        # Random micro-delays throughout operations
+        if np.random.random() < 0.1:  # 10% chance
+            await asyncio.sleep(np.random.uniform(0.1, 0.5))
+    
+    async def _update_behavioral_state(self) -> None:
+        """Update behavioral simulation state"""
+        # Implementation would update various behavioral parameters
+        pass
+    
+    async def _resume_trading_after_delay(self, delay: float) -> None:
+        """Resume trading after specified delay"""
+        await asyncio.sleep(delay)
+        self.accept_new_trades = True
+        self.logger.info("Resumed accepting new trades")
+    
+    async def _handle_filled_order(self, order: Order) -> None:
+        """Handle filled order"""
+        self.logger.info(f"Order filled: {order.order_id}")
+        # Update position and calculate immediate P&L impact
+    
+    async def _handle_expired_order(self, order: Order) -> None:
+        """Handle expired order"""
+        self.logger.info(f"Order expired: {order.order_id}")
+        await self.order_manager.update_order_status(order.order_id, OrderStatus.EXPIRED)
+    
+    async def _setup_market_data_subscriptions(self) -> None:
+        """Setup market data subscriptions"""
+        # Subscribe to required symbols
+        symbols = self.config.get("symbols", [])
+        for symbol in symbols:
+            await self.market_data_engine.subscribe(symbol)
+    
+    async def _setup_risk_monitoring(self) -> None:
+        """Setup risk monitoring parameters"""
+        risk_params = {
+            "max_position_size": self.config.get("max_position_size"),
+            "max_drawdown": float(self.max_drawdown_limit),
+            "var_limit": self.config.get("var_limit", 0.05),
+            "concentration_limit": self.config.get("concentration_limit", 0.2)
+        }
+        await self.risk_engine.configure(risk_params)
+    
+    async def _send_emergency_notification(self) -> None:
+        """Send emergency notification"""
+        # Implementation would send alerts via configured channels
+        self.logger.critical("Emergency notification sent")

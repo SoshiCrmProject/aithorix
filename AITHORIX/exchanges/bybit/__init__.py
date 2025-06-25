@@ -1,5 +1,7 @@
-"""Bybit exchange module"""
+"""
+AITHORIX Bybit Exchange Module
+"""
 
-from .client import BybitExchange
+from .client import BybitClient
 
-__all__ = ["BybitExchange"]
+__all__ = ['BybitClient']

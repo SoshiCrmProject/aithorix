@@ -1,596 +1,519 @@
 """
-AITHORIX Binance Exchange Implementation
-Full production implementation with spot, futures, and options support
+AITHORIX Binance Client Implementation
+Main client for Binance exchange with spot, futures, and options support
 """
 
 import asyncio
-import time
+import logging
 from datetime import datetime, timezone
-from decimal import Decimal
-from typing import Dict, List, Optional, Any, AsyncGenerator
+from typing import Dict, List, Optional, Any, Callable
+import time
 import json
 
-import aiohttp
-import websockets
-from urllib.parse import urlencode
-
 from ..base_exchange import (
-    BaseExchange, ExchangeCredentials, MarketInfo, 
-    OrderBook, Ticker, Balance, WebSocketManager, OrderBookManager
+    BaseExchange, ExchangeConfig, Order, Trade, Position,
+    Balance, Ticker, OrderBook, Candle, OrderType, OrderSide,
+    OrderStatus, TimeInForce, PositionSide
 )
-from ..common import (
-    BINANCE_ORDER_TYPES, BINANCE_TIF,
-    create_signature, get_timestamp, normalize_order_status
-)
-from ...core.engine.trading_engine import Order, OrderType, OrderSide, OrderStatus
-from ...core.exceptions import (
-    ExchangeConnectionError, OrderExecutionError, 
-    AuthenticationError, RateLimitError
-)
-from ...stealth.profiles.binance_institutional import BinanceInstitutionalProfile
+from .spot.spot_trading import BinanceSpotTrading
+from .futures.futures_trading import BinanceFuturesTrading
+from .options.options_trading import BinanceOptionsTrading
+from .websocket.ws_client import BinanceWebSocketClient
+from .auth.authenticator import BinanceAuthenticator
+
+logger = logging.getLogger(__name__)
 
 
-class BinanceExchange(BaseExchange):
+class BinanceClient(BaseExchange):
     """
-    Binance exchange implementation with full trading capabilities
+    Binance exchange client implementation
+    Supports spot, futures, and options trading
     """
     
-    def __init__(self, credentials: ExchangeCredentials, **kwargs):
-        super().__init__(credentials, **kwargs)
+    def __init__(self, config: ExchangeConfig):
+        super().__init__(config)
         
-        self.name = "binance"
-        self.base_url = "https://api.binance.com" if not credentials.testnet else "https://testnet.binance.vision"
-        self.ws_url = "wss://stream.binance.com:9443/ws" if not credentials.testnet else "wss://testnet.binance.vision/ws"
+        # Set Binance-specific URLs
+        if config.testnet:
+            self.config.rest_url = "https://testnet.binance.vision"
+            self.config.ws_url = "wss://testnet.binance.vision/ws"
+        else:
+            self.config.rest_url = "https://api.binance.com"
+            self.config.ws_url = "wss://stream.binance.com:9443/ws"
         
-        # Rate limits
-        self.rate_limits = {
-            "default": 1200,  # requests per minute
-            "orders": 50,     # orders per 10 seconds
-            "weight": 6000    # request weight per minute
-        }
+        # Initialize components
+        self.authenticator = BinanceAuthenticator(config)
+        self.spot_trading = BinanceSpotTrading(self)
+        self.futures_trading = BinanceFuturesTrading(self)
+        self.options_trading = BinanceOptionsTrading(self)
+        self.ws_client = BinanceWebSocketClient(self)
         
-        # WebSocket managers
-        self.market_ws: Optional[WebSocketManager] = None
-        self.user_ws: Optional[WebSocketManager] = None
+        # Market info
+        self.exchange_info: Dict[str, Any] = {}
+        self.symbol_info: Dict[str, Any] = {}
+        
+        # User data stream
         self.listen_key: Optional[str] = None
+        self.listen_key_task: Optional[asyncio.Task] = None
         
-        # Order book managers
-        self.order_books: Dict[str, OrderBookManager] = {}
+        logger.info("Initialized Binance client")
+    
+    async def _initialize_exchange(self):
+        """Binance-specific initialization"""
+        # Load exchange info
+        await self._load_exchange_info()
         
-        # Apply institutional profile for stealth
-        self.profile = BinanceInstitutionalProfile()
-        
-    async def connect(self) -> None:
-        """Initialize Binance connection"""
-        await super().connect()
-        
-        # Start user data stream
-        await self._start_user_data_stream()
-        
-        # Initialize WebSocket connections
-        self.market_ws = WebSocketManager(self.ws_url)
-        await self.market_ws.connect()
-        
-    async def disconnect(self) -> None:
-        """Close Binance connections"""
-        # Stop user data stream
-        await self._stop_user_data_stream()
-        
-        # Close WebSocket connections
-        if self.market_ws:
-            await self.market_ws.disconnect()
-        if self.user_ws:
-            await self.user_ws.disconnect()
+        # Start user data stream if authenticated
+        if self.config.api_key:
+            await self._start_user_data_stream()
+    
+    async def _load_markets(self):
+        """Load Binance market information"""
+        await self._load_exchange_info()
+    
+    async def _load_exchange_info(self):
+        """Load exchange trading rules and symbols"""
+        try:
+            # Get spot exchange info
+            spot_info = await self._get("/api/v3/exchangeInfo")
             
-        await super().disconnect()
+            # Get futures exchange info
+            futures_info = await self._get("/fapi/v1/exchangeInfo")
+            
+            # Process symbols
+            self.exchange_info = {
+                'spot': spot_info,
+                'futures': futures_info
+            }
+            
+            # Build symbol info cache
+            for symbol_data in spot_info.get('symbols', []):
+                symbol = symbol_data['symbol']
+                self.symbol_info[symbol] = {
+                    'type': 'spot',
+                    'base': symbol_data['baseAsset'],
+                    'quote': symbol_data['quoteAsset'],
+                    'status': symbol_data['status'],
+                    'filters': {f['filterType']: f for f in symbol_data['filters']},
+                    'permissions': symbol_data['permissions']
+                }
+            
+            for symbol_data in futures_info.get('symbols', []):
+                symbol = symbol_data['symbol']
+                self.symbol_info[f"{symbol}_PERP"] = {
+                    'type': 'futures',
+                    'base': symbol_data['baseAsset'],
+                    'quote': symbol_data['quoteAsset'],
+                    'status': symbol_data['status'],
+                    'filters': {f['filterType']: f for f in symbol_data['filters']},
+                    'contractType': symbol_data.get('contractType', 'PERPETUAL')
+                }
+            
+            logger.info(f"Loaded {len(self.symbol_info)} symbols from Binance")
+            
+        except Exception as e:
+            logger.error(f"Failed to load exchange info: {str(e)}")
+            raise
+    
+    async def _check_connection(self):
+        """Check Binance connection"""
+        # Ping endpoint
+        await self._get("/api/v3/ping")
         
-    def _sign_request(self, method: str, path: str, params: Dict[str, Any]) -> Dict[str, str]:
-        """Sign request for Binance API"""
-        # Add timestamp
-        params["timestamp"] = get_timestamp()
+        # Get server time
+        response = await self._get("/api/v3/time")
+        server_time = response['serverTime']
+        local_time = int(time.time() * 1000)
         
-        # Create query string
-        query_string = urlencode(sorted(params.items()))
-        
-        # Create signature
-        signature = create_signature(self.credentials.api_secret, query_string)
-        
-        # Return headers
-        return {
-            "X-MBX-APIKEY": self.credentials.api_key
-        }
-        
-    async def _start_user_data_stream(self) -> None:
+        time_diff = abs(server_time - local_time)
+        if time_diff > 5000:  # 5 seconds
+            logger.warning(f"Time sync issue: server time differs by {time_diff}ms")
+    
+    async def _get_auth_headers(
+        self,
+        method: str,
+        endpoint: str,
+        params: Optional[Dict],
+        data: Optional[Dict]
+    ) -> Dict[str, str]:
+        """Generate Binance authentication headers"""
+        return await self.authenticator.get_auth_headers(method, endpoint, params, data)
+    
+    async def _start_user_data_stream(self):
         """Start user data stream for account updates"""
         try:
-            response = await self._make_request(
-                "POST",
-                "/api/v3/userDataStream",
-                signed=True
-            )
+            # Create listen key
+            response = await self._post("/api/v3/userDataStream", signed=True)
+            self.listen_key = response['listenKey']
             
-            self.listen_key = response.get("listenKey")
+            # Start keepalive task
+            self.listen_key_task = asyncio.create_task(self._keepalive_listen_key())
             
-            if self.listen_key:
-                # Connect to user data stream
-                user_ws_url = f"{self.ws_url}/{self.listen_key}"
-                self.user_ws = WebSocketManager(user_ws_url)
-                await self.user_ws.connect()
-                
-                # Start keepalive task
-                asyncio.create_task(self._keepalive_user_stream())
-                
-                # Start processing user events
-                asyncio.create_task(self._process_user_stream())
-                
+            logger.info("Started Binance user data stream")
+            
         except Exception as e:
-            logger.error(f"Failed to start user data stream: {e}")
-            
-    async def _stop_user_data_stream(self) -> None:
-        """Stop user data stream"""
-        if self.listen_key:
-            try:
-                await self._make_request(
-                    "DELETE",
-                    "/api/v3/userDataStream",
-                    params={"listenKey": self.listen_key},
-                    signed=True
-                )
-            except Exception as e:
-                logger.error(f"Failed to stop user data stream: {e}")
-                
-    async def _keepalive_user_stream(self) -> None:
-        """Keep user data stream alive"""
-        while self.listen_key:
+            logger.error(f"Failed to start user data stream: {str(e)}")
+    
+    async def _keepalive_listen_key(self):
+        """Keep listen key alive"""
+        while self.is_initialized:
             try:
                 await asyncio.sleep(1800)  # 30 minutes
                 
-                await self._make_request(
-                    "PUT",
-                    "/api/v3/userDataStream",
-                    params={"listenKey": self.listen_key},
-                    signed=True
-                )
-                
-            except Exception as e:
-                logger.error(f"Failed to keepalive user stream: {e}")
-                await asyncio.sleep(60)
-                
-    async def _process_user_stream(self) -> None:
-        """Process user data stream events"""
-        if not self.user_ws:
-            return
-            
-        async for message in self.user_ws.receive():
-            try:
-                event_type = message.get("e")
-                
-                if event_type == "executionReport":
-                    # Order update
-                    await self._handle_order_update(message)
-                elif event_type == "outboundAccountPosition":
-                    # Balance update
-                    await self._handle_balance_update(message)
+                if self.listen_key:
+                    await self._request(
+                        "PUT",
+                        "/api/v3/userDataStream",
+                        params={'listenKey': self.listen_key},
+                        signed=True
+                    )
+                    logger.debug("Renewed listen key")
                     
             except Exception as e:
-                logger.error(f"Error processing user stream: {e}")
-                
-    async def _handle_order_update(self, data: Dict[str, Any]) -> None:
-        """Handle order update from user stream"""
-        # Extract order information
-        order_update = {
-            "order_id": data.get("c"),  # Client order ID
-            "exchange_order_id": data.get("i"),
-            "symbol": data.get("s"),
-            "status": normalize_order_status(data.get("X")),
-            "filled_quantity": Decimal(data.get("z", "0")),
-            "average_price": Decimal(data.get("Z", "0")) / Decimal(data.get("z", "1")) if Decimal(data.get("z", "0")) > 0 else Decimal("0"),
-            "commission": Decimal(data.get("n", "0")),
-            "commission_asset": data.get("N")
-        }
-        
-        # Notify trading engine
-        # This would typically emit an event or update a shared state
-        logger.info(f"Order update: {order_update}")
-        
-    async def _handle_balance_update(self, data: Dict[str, Any]) -> None:
-        """Handle balance update from user stream"""
-        # Update internal balance cache
-        for balance in data.get("B", []):
-            asset = balance.get("a")
-            free = Decimal(balance.get("f", "0"))
-            locked = Decimal(balance.get("l", "0"))
-            
-            # Update cache
-            # This would typically update a shared state
-            logger.debug(f"Balance update: {asset} - free: {free}, locked: {locked}")
-            
-    async def get_markets(self) -> List[MarketInfo]:
-        """Get all available markets on Binance"""
-        response = await self._make_request("GET", "/api/v3/exchangeInfo")
-        
-        markets = []
-        for symbol_info in response.get("symbols", []):
-            if symbol_info.get("status") != "TRADING":
-                continue
-                
-            # Extract filters
-            filters = {f["filterType"]: f for f in symbol_info.get("filters", [])}
-            
-            # Price filter
-            price_filter = filters.get("PRICE_FILTER", {})
-            min_price = Decimal(price_filter.get("minPrice", "0"))
-            max_price = Decimal(price_filter.get("maxPrice", "999999999"))
-            price_precision = len(price_filter.get("minPrice", "0.1").split(".")[-1].rstrip("0"))
-            
-            # Lot size filter
-            lot_filter = filters.get("LOT_SIZE", {})
-            min_quantity = Decimal(lot_filter.get("minQty", "0"))
-            max_quantity = Decimal(lot_filter.get("maxQty", "999999999"))
-            quantity_precision = len(lot_filter.get("stepSize", "0.1").split(".")[-1].rstrip("0"))
-            
-            # Min notional filter
-            notional_filter = filters.get("MIN_NOTIONAL", {})
-            min_notional = Decimal(notional_filter.get("minNotional", "0"))
-            
-            # Get current price for fee calculation
-            ticker = await self.get_ticker(symbol_info["symbol"])
-            
-            market = MarketInfo(
-                symbol=symbol_info["symbol"],
-                base_asset=symbol_info["baseAsset"],
-                quote_asset=symbol_info["quoteAsset"],
-                min_quantity=min_quantity,
-                max_quantity=max_quantity,
-                quantity_precision=quantity_precision,
-                min_price=min_price,
-                max_price=max_price,
-                price_precision=price_precision,
-                min_notional=min_notional,
-                is_trading=True,
-                maker_fee=Decimal("0.001"),  # Default 0.1%
-                taker_fee=Decimal("0.001"),  # Default 0.1%
-                last=ticker.last
+                logger.error(f"Failed to renew listen key: {str(e)}")
+                # Try to recreate
+                await self._start_user_data_stream()
+    
+    # Trading methods
+    async def place_order(
+        self,
+        symbol: str,
+        side: str,
+        order_type: OrderType,
+        size: float,
+        price: Optional[float] = None,
+        params: Optional[Dict] = None
+    ) -> Order:
+        """Place an order on Binance"""
+        # Determine market type
+        if symbol in self.symbol_info and self.symbol_info[symbol]['type'] == 'spot':
+            return await self.spot_trading.place_order(
+                symbol, side, order_type, size, price, params
             )
-            
-            markets.append(market)
-            
-        return markets
+        elif symbol.endswith('_PERP') or (params and params.get('futures', False)):
+            return await self.futures_trading.place_order(
+                symbol, side, order_type, size, price, params
+            )
+        else:
+            # Default to spot
+            return await self.spot_trading.place_order(
+                symbol, side, order_type, size, price, params
+            )
+    
+    async def cancel_order(self, order_id: str, symbol: Optional[str] = None) -> bool:
+        """Cancel an order"""
+        if not symbol:
+            raise ValueError("Symbol is required for Binance order cancellation")
         
+        if symbol in self.symbol_info and self.symbol_info[symbol]['type'] == 'spot':
+            return await self.spot_trading.cancel_order(order_id, symbol)
+        else:
+            return await self.futures_trading.cancel_order(order_id, symbol)
+    
+    async def get_order(self, order_id: str, symbol: Optional[str] = None) -> Order:
+        """Get order details"""
+        if not symbol:
+            raise ValueError("Symbol is required for Binance order query")
+        
+        if symbol in self.symbol_info and self.symbol_info[symbol]['type'] == 'spot':
+            return await self.spot_trading.get_order(order_id, symbol)
+        else:
+            return await self.futures_trading.get_order(order_id, symbol)
+    
+    async def get_open_orders(self, symbol: Optional[str] = None) -> List[Order]:
+        """Get all open orders"""
+        orders = []
+        
+        # Get spot orders
+        spot_orders = await self.spot_trading.get_open_orders(symbol)
+        orders.extend(spot_orders)
+        
+        # Get futures orders
+        futures_orders = await self.futures_trading.get_open_orders(symbol)
+        orders.extend(futures_orders)
+        
+        return orders
+    
+    async def get_order_history(
+        self,
+        symbol: Optional[str] = None,
+        limit: int = 100,
+        start_time: Optional[datetime] = None
+    ) -> List[Order]:
+        """Get order history"""
+        if symbol and symbol in self.symbol_info:
+            if self.symbol_info[symbol]['type'] == 'spot':
+                return await self.spot_trading.get_order_history(symbol, limit, start_time)
+            else:
+                return await self.futures_trading.get_order_history(symbol, limit, start_time)
+        else:
+            # Get from both
+            orders = []
+            
+            spot_orders = await self.spot_trading.get_order_history(symbol, limit, start_time)
+            futures_orders = await self.futures_trading.get_order_history(symbol, limit, start_time)
+            
+            orders.extend(spot_orders)
+            orders.extend(futures_orders)
+            
+            # Sort by timestamp
+            orders.sort(key=lambda x: x.created_at, reverse=True)
+            
+            return orders[:limit]
+    
+    # Market data methods
     async def get_ticker(self, symbol: str) -> Ticker:
-        """Get current ticker for symbol"""
-        response = await self._make_request(
-            "GET",
-            "/api/v3/ticker/24hr",
-            params={"symbol": symbol}
-        )
+        """Get ticker for a symbol"""
+        endpoint = "/api/v3/ticker/24hr"
+        params = {'symbol': self._normalize_symbol(symbol)}
+        
+        data = await self._get(endpoint, params=params)
         
         return Ticker(
-            timestamp=datetime.now(timezone.utc),
             symbol=symbol,
-            bid=Decimal(response.get("bidPrice", "0")),
-            ask=Decimal(response.get("askPrice", "0")),
-            last=Decimal(response.get("lastPrice", "0")),
-            volume_24h=Decimal(response.get("volume", "0")),
-            high_24h=Decimal(response.get("highPrice", "0")),
-            low_24h=Decimal(response.get("lowPrice", "0")),
-            change_24h=Decimal(response.get("priceChangePercent", "0"))
+            bid=float(data['bidPrice']),
+            ask=float(data['askPrice']),
+            last=float(data['lastPrice']),
+            volume_24h=float(data['volume']),
+            quote_volume_24h=float(data['quoteVolume']),
+            high_24h=float(data['highPrice']),
+            low_24h=float(data['lowPrice']),
+            change_24h=float(data['priceChange']),
+            change_percent_24h=float(data['priceChangePercent']),
+            timestamp=datetime.now(timezone.utc)
         )
+    
+    async def get_all_tickers(self) -> Dict[str, Ticker]:
+        """Get all tickers"""
+        endpoint = "/api/v3/ticker/24hr"
         
-    async def get_order_book(self, symbol: str, limit: int = 100) -> OrderBook:
-        """Get order book for symbol"""
-        response = await self._make_request(
-            "GET",
-            "/api/v3/depth",
-            params={"symbol": symbol, "limit": limit}
-        )
+        data = await self._get(endpoint)
         
-        bids = [(Decimal(b[0]), Decimal(b[1])) for b in response.get("bids", [])]
-        asks = [(Decimal(a[0]), Decimal(a[1])) for a in response.get("asks", [])]
+        tickers = {}
+        for ticker_data in data:
+            symbol = self._denormalize_symbol(ticker_data['symbol'])
+            tickers[symbol] = Ticker(
+                symbol=symbol,
+                bid=float(ticker_data['bidPrice']),
+                ask=float(ticker_data['askPrice']),
+                last=float(ticker_data['lastPrice']),
+                volume_24h=float(ticker_data['volume']),
+                quote_volume_24h=float(ticker_data['quoteVolume']),
+                high_24h=float(ticker_data['highPrice']),
+                low_24h=float(ticker_data['lowPrice']),
+                change_24h=float(ticker_data['priceChange']),
+                change_percent_24h=float(ticker_data['priceChangePercent']),
+                timestamp=datetime.now(timezone.utc)
+            )
+        
+        return tickers
+    
+    async def get_order_book(self, symbol: str, limit: int = 20) -> OrderBook:
+        """Get order book"""
+        endpoint = "/api/v3/depth"
+        params = {
+            'symbol': self._normalize_symbol(symbol),
+            'limit': limit
+        }
+        
+        data = await self._get(endpoint, params=params)
         
         return OrderBook(
-            timestamp=datetime.now(timezone.utc),
             symbol=symbol,
-            bids=bids,
-            asks=asks
+            bids=[(float(price), float(size)) for price, size in data['bids']],
+            asks=[(float(price), float(size)) for price, size in data['asks']],
+            timestamp=datetime.now(timezone.utc),
+            sequence=data.get('lastUpdateId')
         )
-        
-    async def get_balance(self) -> List[Balance]:
-        """Get account balances"""
-        response = await self._make_request(
-            "GET",
-            "/api/v3/account",
-            signed=True
-        )
-        
-        balances = []
-        for balance_data in response.get("balances", []):
-            free = Decimal(balance_data.get("free", "0"))
-            locked = Decimal(balance_data.get("locked", "0"))
-            
-            if free > 0 or locked > 0:
-                balance = Balance(
-                    asset=balance_data["asset"],
-                    free=free,
-                    locked=locked,
-                    total=free + locked
-                )
-                balances.append(balance)
-                
-        return balances
-        
-    async def place_order(self, order: Order) -> Dict[str, Any]:
-        """Place new order on Binance"""
-        # Apply institutional behavior
-        await self.profile.pre_order_behavior(order)
-        
-        # Validate order
-        valid, error = self.validate_order(order)
-        if not valid:
-            raise OrderExecutionError(f"Order validation failed: {error}", order.order_id, self.name)
-            
-        # Prepare order parameters
-        params = {
-            "symbol": order.symbol,
-            "side": order.side.value,
-            "type": BINANCE_ORDER_TYPES.get(order.order_type, "LIMIT"),
-            "quantity": str(self.round_quantity(order.symbol, order.quantity)),
-            "newClientOrderId": order.order_id[:36]  # Binance limit
-        }
-        
-        # Add order type specific parameters
-        if order.order_type == OrderType.LIMIT:
-            params["price"] = str(self.round_price(order.symbol, order.price))
-            params["timeInForce"] = BINANCE_TIF.get(order.time_in_force, "GTC")
-            
-            if order.post_only:
-                params["timeInForce"] = "GTX"
-                
-        elif order.order_type in [OrderType.STOP_LOSS, OrderType.TAKE_PROFIT]:
-            params["stopPrice"] = str(self.round_price(order.symbol, order.stop_price))
-            if order.order_type == OrderType.STOP_LOSS:
-                params["type"] = "STOP_LOSS_LIMIT"
-            else:
-                params["type"] = "TAKE_PROFIT_LIMIT"
-            params["price"] = str(self.round_price(order.symbol, order.price))
-            params["timeInForce"] = "GTC"
-            
-        # Add leverage for futures
-        if order.leverage > 1:
-            # This would be handled differently for futures API
-            pass
-            
-        # Place order
-        try:
-            response = await self._make_request(
-                "POST",
-                "/api/v3/order",
-                params=params,
-                signed=True
-            )
-            
-            # Apply post-order behavior
-            await self.profile.post_order_behavior(order, response)
-            
-            return {
-                "order_id": order.order_id,
-                "exchange_order_id": str(response.get("orderId")),
-                "status": normalize_order_status(response.get("status")),
-                "filled_quantity": Decimal(response.get("executedQty", "0")),
-                "average_price": Decimal(response.get("price", "0")),
-                "created_at": datetime.fromtimestamp(response.get("transactTime", 0) / 1000, tz=timezone.utc)
-            }
-            
-        except Exception as e:
-            logger.error(f"Failed to place order on Binance: {e}")
-            raise OrderExecutionError(str(e), order.order_id, self.name)
-            
-    async def cancel_order(self, order_id: str, symbol: str) -> Dict[str, Any]:
-        """Cancel existing order"""
-        params = {
-            "symbol": symbol,
-            "origClientOrderId": order_id[:36]
-        }
-        
-        response = await self._make_request(
-            "DELETE",
-            "/api/v3/order",
-            params=params,
-            signed=True
-        )
-        
-        return {
-            "order_id": order_id,
-            "exchange_order_id": str(response.get("orderId")),
-            "status": "CANCELLED"
-        }
-        
-    async def get_order_status(self, order_id: str, symbol: str) -> Dict[str, Any]:
-        """Get order status"""
-        params = {
-            "symbol": symbol,
-            "origClientOrderId": order_id[:36]
-        }
-        
-        response = await self._make_request(
-            "GET",
-            "/api/v3/order",
-            params=params,
-            signed=True
-        )
-        
-        return {
-            "order_id": order_id,
-            "exchange_order_id": str(response.get("orderId")),
-            "status": normalize_order_status(response.get("status")),
-            "filled_quantity": Decimal(response.get("executedQty", "0")),
-            "average_price": Decimal(response.get("price", "0"))
-        }
-        
-    async def get_open_orders(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Get all open orders"""
-        params = {}
-        if symbol:
-            params["symbol"] = symbol
-            
-        response = await self._make_request(
-            "GET",
-            "/api/v3/openOrders",
-            params=params,
-            signed=True
-        )
-        
-        orders = []
-        for order_data in response:
-            orders.append({
-                "order_id": order_data.get("clientOrderId"),
-                "exchange_order_id": str(order_data.get("orderId")),
-                "symbol": order_data.get("symbol"),
-                "side": order_data.get("side"),
-                "type": order_data.get("type"),
-                "status": normalize_order_status(order_data.get("status")),
-                "quantity": Decimal(order_data.get("origQty", "0")),
-                "filled_quantity": Decimal(order_data.get("executedQty", "0")),
-                "price": Decimal(order_data.get("price", "0")),
-                "created_at": datetime.fromtimestamp(order_data.get("time", 0) / 1000, tz=timezone.utc)
-            })
-            
-        return orders
-        
-    async def subscribe_ticker(self, symbol: str) -> AsyncGenerator[Ticker, None]:
-        """Subscribe to ticker updates via WebSocket"""
-        stream_name = f"{symbol.lower()}@ticker"
-        
-        # Subscribe to stream
-        await self.market_ws.send({
-            "method": "SUBSCRIBE",
-            "params": [stream_name],
-            "id": int(time.time())
-        })
-        
-        async for message in self.market_ws.receive():
-            if message.get("e") == "24hrTicker":
-                yield Ticker(
-                    timestamp=datetime.fromtimestamp(message.get("E", 0) / 1000, tz=timezone.utc),
-                    symbol=message.get("s"),
-                    bid=Decimal(message.get("b", "0")),
-                    ask=Decimal(message.get("a", "0")),
-                    last=Decimal(message.get("c", "0")),
-                    volume_24h=Decimal(message.get("v", "0")),
-                    high_24h=Decimal(message.get("h", "0")),
-                    low_24h=Decimal(message.get("l", "0")),
-                    change_24h=Decimal(message.get("P", "0"))
-                )
-                
-    async def subscribe_order_book(self, symbol: str) -> AsyncGenerator[OrderBook, None]:
-        """Subscribe to order book updates via WebSocket"""
-        # Create order book manager
-        if symbol not in self.order_books:
-            self.order_books[symbol] = OrderBookManager(symbol)
-            
-        manager = self.order_books[symbol]
-        
-        # Get initial snapshot
-        snapshot = await self.get_order_book(symbol)
-        manager.update_snapshot(
-            [[str(p), str(q)] for p, q in snapshot.bids],
-            [[str(p), str(q)] for p, q in snapshot.asks]
-        )
-        
-        # Subscribe to updates
-        stream_name = f"{symbol.lower()}@depth@100ms"
-        await self.market_ws.send({
-            "method": "SUBSCRIBE",
-            "params": [stream_name],
-            "id": int(time.time())
-        })
-        
-        async for message in self.market_ws.receive():
-            if message.get("e") == "depthUpdate":
-                # Update order book
-                manager.update_delta(
-                    message.get("b", []),
-                    message.get("a", []),
-                    message.get("u")
-                )
-                
-                # Yield updated order book
-                yield manager.get_order_book()
-                
-    async def subscribe_trades(self, symbol: str) -> AsyncGenerator[Dict[str, Any], None]:
-        """Subscribe to trade updates via WebSocket"""
-        stream_name = f"{symbol.lower()}@trade"
-        
-        await self.market_ws.send({
-            "method": "SUBSCRIBE",
-            "params": [stream_name],
-            "id": int(time.time())
-        })
-        
-        async for message in self.market_ws.receive():
-            if message.get("e") == "trade":
-                yield {
-                    "trade_id": message.get("t"),
-                    "timestamp": datetime.fromtimestamp(message.get("T", 0) / 1000, tz=timezone.utc),
-                    "symbol": message.get("s"),
-                    "price": Decimal(message.get("p", "0")),
-                    "quantity": Decimal(message.get("q", "0")),
-                    "is_buyer_maker": message.get("m", False)
-                }
-                
-
-class BinanceFuturesExchange(BinanceExchange):
-    """
-    Binance Futures (USDⓈ-M) implementation
-    """
     
-    def __init__(self, credentials: ExchangeCredentials, **kwargs):
-        super().__init__(credentials, **kwargs)
-        
-        self.base_url = "https://fapi.binance.com" if not credentials.testnet else "https://testnet.binancefuture.com"
-        self.ws_url = "wss://fstream.binance.com/ws" if not credentials.testnet else "wss://testnet.binancefuture.com/ws"
-        
-    async def set_leverage(self, symbol: str, leverage: int) -> Dict[str, Any]:
-        """Set leverage for symbol"""
+    async def get_candles(
+        self,
+        symbol: str,
+        timeframe: str,
+        limit: int = 100,
+        start_time: Optional[datetime] = None
+    ) -> List[Candle]:
+        """Get candlestick data"""
+        endpoint = "/api/v3/klines"
         params = {
-            "symbol": symbol,
-            "leverage": leverage
+            'symbol': self._normalize_symbol(symbol),
+            'interval': self._convert_timeframe(timeframe),
+            'limit': limit
         }
         
-        response = await self._make_request(
-            "POST",
-            "/fapi/v1/leverage",
-            params=params,
-            signed=True
-        )
+        if start_time:
+            params['startTime'] = int(start_time.timestamp() * 1000)
         
-        return {
-            "symbol": symbol,
-            "leverage": response.get("leverage"),
-            "max_notional": Decimal(response.get("maxNotionalValue", "0"))
+        data = await self._get(endpoint, params=params)
+        
+        candles = []
+        for candle_data in data:
+            candles.append(Candle(
+                symbol=symbol,
+                timeframe=timeframe,
+                open_time=datetime.fromtimestamp(candle_data[0] / 1000, tz=timezone.utc),
+                close_time=datetime.fromtimestamp(candle_data[6] / 1000, tz=timezone.utc),
+                open=float(candle_data[1]),
+                high=float(candle_data[2]),
+                low=float(candle_data[3]),
+                close=float(candle_data[4]),
+                volume=float(candle_data[5]),
+                quote_volume=float(candle_data[7]),
+                trades=int(candle_data[8])
+            ))
+        
+        return candles
+    
+    async def get_trades(self, symbol: str, limit: int = 100) -> List[Trade]:
+        """Get recent trades"""
+        endpoint = "/api/v3/trades"
+        params = {
+            'symbol': self._normalize_symbol(symbol),
+            'limit': limit
         }
         
-    async def get_positions(self) -> List[Dict[str, Any]]:
-        """Get all open positions"""
-        response = await self._make_request(
-            "GET",
-            "/fapi/v2/positionRisk",
-            signed=True
+        data = await self._get(endpoint, params=params)
+        
+        trades = []
+        for trade_data in data:
+            trades.append(Trade(
+                trade_id=str(trade_data['id']),
+                order_id="",  # Not provided in public trades
+                symbol=symbol,
+                side=OrderSide.BUY if trade_data['isBuyerMaker'] else OrderSide.SELL,
+                price=float(trade_data['price']),
+                size=float(trade_data['qty']),
+                fee=0.0,  # Not provided in public trades
+                fee_currency="",
+                timestamp=datetime.fromtimestamp(trade_data['time'] / 1000, tz=timezone.utc),
+                is_maker=trade_data['isBuyerMaker']
+            ))
+        
+        return trades
+    
+    # Account methods
+    async def get_balance(self) -> Dict[str, Balance]:
+        """Get account balance"""
+        balances = {}
+        
+        # Get spot balances
+        spot_balances = await self.spot_trading.get_balance()
+        balances.update(spot_balances)
+        
+        # Get futures balances
+        futures_balances = await self.futures_trading.get_balance()
+        balances.update(futures_balances)
+        
+        return balances
+    
+    async def get_open_positions(self) -> List[Position]:
+        """Get open positions (futures only)"""
+        return await self.futures_trading.get_open_positions()
+    
+    async def get_position(self, symbol: str) -> Optional[Position]:
+        """Get specific position"""
+        return await self.futures_trading.get_position(symbol)
+    
+    # WebSocket methods
+    async def _connect_websocket(self):
+        """Connect to Binance WebSocket"""
+        await self.ws_client.connect(
+            on_message=self.ws_on_message,
+            on_error=self.ws_on_error,
+            on_close=self.ws_on_close
         )
         
-        positions = []
-        for pos in response:
-            position_amt = Decimal(pos.get("positionAmt", "0"))
-            if position_amt != 0:
-                positions.append({
-                    "symbol": pos.get("symbol"),
-                    "side": "LONG" if position_amt > 0 else "SHORT",
-                    "quantity": abs(position_amt),
-                    "entry_price": Decimal(pos.get("entryPrice", "0")),
-                    "mark_price": Decimal(pos.get("markPrice", "0")),
-                    "unrealized_pnl": Decimal(pos.get("unRealizedProfit", "0")),
-                    "leverage": int(pos.get("leverage", 1)),
-                    "liquidation_price": Decimal(pos.get("liquidationPrice", "0"))
-                })
-                
-        return positions
+        # Subscribe to user data stream if we have a listen key
+        if self.listen_key:
+            await self.ws_client.subscribe_user_stream(self.listen_key)
+    
+    async def subscribe_ticker(self, symbol: str):
+        """Subscribe to ticker updates"""
+        await self.ws_client.subscribe_ticker(symbol)
+    
+    async def subscribe_orderbook(self, symbol: str, depth: int = 20):
+        """Subscribe to order book updates"""
+        await self.ws_client.subscribe_orderbook(symbol, depth)
+    
+    async def subscribe_trades(self, symbol: str):
+        """Subscribe to trade updates"""
+        await self.ws_client.subscribe_trades(symbol)
+    
+    async def subscribe_user_orders(self):
+        """Subscribe to user order updates"""
+        if self.listen_key:
+            # Already subscribed via user data stream
+            pass
+        else:
+            logger.warning("Cannot subscribe to user orders without authentication")
+    
+    async def subscribe_user_positions(self):
+        """Subscribe to user position updates"""
+        if self.listen_key:
+            # Already subscribed via user data stream
+            pass
+        else:
+            logger.warning("Cannot subscribe to user positions without authentication")
+    
+    # Helper methods
+    def _convert_timeframe(self, timeframe: str) -> str:
+        """Convert standard timeframe to Binance format"""
+        timeframe_map = {
+            '1m': '1m',
+            '3m': '3m',
+            '5m': '5m',
+            '15m': '15m',
+            '30m': '30m',
+            '1h': '1h',
+            '2h': '2h',
+            '4h': '4h',
+            '6h': '6h',
+            '8h': '8h',
+            '12h': '12h',
+            '1d': '1d',
+            '3d': '3d',
+            '1w': '1w',
+            '1M': '1M'
+        }
+        return timeframe_map.get(timeframe, timeframe)
+    
+    def _convert_order_type(self, order_type: OrderType) -> str:
+        """Convert OrderType to Binance format"""
+        type_map = {
+            OrderType.MARKET: 'MARKET',
+            OrderType.LIMIT: 'LIMIT',
+            OrderType.STOP: 'STOP_LOSS',
+            OrderType.STOP_LIMIT: 'STOP_LOSS_LIMIT',
+            OrderType.POST_ONLY: 'LIMIT_MAKER'
+        }
+        return type_map.get(order_type, 'LIMIT')
+    
+    def _convert_time_in_force(self, tif: TimeInForce) -> str:
+        """Convert TimeInForce to Binance format"""
+        tif_map = {
+            TimeInForce.GTC: 'GTC',
+            TimeInForce.IOC: 'IOC',
+            TimeInForce.FOK: 'FOK',
+            TimeInForce.GTX: 'GTX'
+        }
+        return tif_map.get(tif, 'GTC')
+    
+    async def shutdown(self):
+        """Shutdown Binance client"""
+        # Cancel listen key task
+        if self.listen_key_task:
+            self.listen_key_task.cancel()
+        
+        # Delete listen key
+        if self.listen_key:
+            try:
+                await self._delete(
+                    "/api/v3/userDataStream",
+                    params={'listenKey': self.listen_key},
+                    signed=True
+                )
+            except Exception:
+                pass
+        
+        # Call parent shutdown
+        await super().shutdown()

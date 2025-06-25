@@ -1,5 +1,7 @@
-"""MEXC exchange module"""
+"""
+AITHORIX MEXC Exchange Module
+"""
 
-from .client import MEXCExchange, MEXCFuturesExchange
+from .client import MEXCClient
 
-__all__ = ["MEXCExchange", "MEXCFuturesExchange"]
+__all__ = ['MEXCClient']

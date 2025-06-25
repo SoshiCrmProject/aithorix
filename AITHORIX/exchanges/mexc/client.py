@@ -1,613 +1,462 @@
 """
-AITHORIX MEXC Exchange Implementation
-Full production implementation with spot and futures support
-Specialized for altcoin trading and new listings
+AITHORIX MEXC Client Implementation
+Exchange specializing in altcoins and new listings
 """
 
 import asyncio
+import logging
+from datetime import datetime, timezone
+from typing import Dict, List, Optional, Any, Callable
 import time
 import hmac
 import hashlib
-from datetime import datetime, timezone
-from decimal import Decimal
-from typing import Dict, List, Optional, Any, AsyncGenerator
 from urllib.parse import urlencode
-import json
 
 from ..base_exchange import (
-    BaseExchange, ExchangeCredentials, MarketInfo, 
-    OrderBook, Ticker, Balance, WebSocketManager, OrderBookManager
+    BaseExchange, ExchangeConfig, Order, Trade, Position,
+    Balance, Ticker, OrderBook, Candle, OrderType, OrderSide,
+    OrderStatus, TimeInForce, PositionSide
 )
-from ..common import (
-    MEXC_ORDER_TYPES, MEXC_TIF,
-    get_timestamp, normalize_order_status
-)
-from ...core.engine.trading_engine import Order, OrderType, OrderSide, OrderStatus
-from ...core.exceptions import (
-    ExchangeConnectionError, OrderExecutionError,
-    AuthenticationError
-)
-from ...stealth.profiles.mexc_retail import MEXCRetailProfile
+from .spot.spot_trading import MEXCSpotTrading
+from .futures.futures_trading import MEXCFuturesTrading
+from .websocket.ws_client import MEXCWebSocketClient
+from .auth.authenticator import MEXCAuthenticator
+
+logger = logging.getLogger(__name__)
 
 
-class MEXCExchange(BaseExchange):
+class MEXCClient(BaseExchange):
     """
-    MEXC exchange implementation
-    Optimized for altcoin discovery and high-frequency retail trading
+    MEXC exchange client implementation
+    Focus on altcoins and new token listings
     """
     
-    def __init__(self, credentials: ExchangeCredentials, **kwargs):
-        super().__init__(credentials, **kwargs)
+    def __init__(self, config: ExchangeConfig):
+        super().__init__(config)
         
-        self.name = "mexc"
-        self.base_url = "https://api.mexc.com"
-        self.ws_url = "wss://wbs.mexc.com/ws"
-        self.contract_url = "https://contract.mexc.com"
-        
-        # Rate limits (more restrictive than others)
-        self.rate_limits = {
-            "default": 20,    # requests per second
-            "orders": 10,     # orders per second
-            "public": 10      # public endpoints per second
-        }
-        
-        # MEXC specific features
-        self.supports_margin = True
-        self.supports_futures = True
-        self.supports_otc = True
-        self.max_open_orders = 200
-        
-        # WebSocket managers
-        self.spot_ws: Optional[WebSocketManager] = None
-        self.futures_ws: Optional[WebSocketManager] = None
-        
-        # Apply retail trader profile
-        self.profile = MEXCRetailProfile()
-        
-        # New listing tracker
-        self.new_listings: Dict[str, datetime] = {}
-        self._last_listing_check = 0
-        
-    async def connect(self) -> None:
-        """Initialize MEXC connection"""
-        await super().connect()
-        
-        # Initialize WebSocket connections
-        self.spot_ws = WebSocketManager(self.ws_url)
-        await self.spot_ws.connect()
-        
-        # Start new listing monitor
-        asyncio.create_task(self._monitor_new_listings())
-        
-    async def disconnect(self) -> None:
-        """Close MEXC connections"""
-        if self.spot_ws:
-            await self.spot_ws.disconnect()
-        if self.futures_ws:
-            await self.futures_ws.disconnect()
-            
-        await super().disconnect()
-        
-    def _sign_request(self, method: str, path: str, params: Dict[str, Any]) -> Dict[str, str]:
-        """Sign request for MEXC API"""
-        timestamp = str(get_timestamp())
-        
-        # MEXC uses different signing for different endpoints
-        if "/api/v3/" in path:
-            # Spot API signing
-            params["timestamp"] = timestamp
-            params["recvWindow"] = "5000"
-            
-            # Sort parameters
-            sorted_params = sorted(params.items())
-            query_string = urlencode(sorted_params)
-            
-            # Create signature
-            signature = hmac.new(
-                self.credentials.api_secret.encode('utf-8'),
-                query_string.encode('utf-8'),
-                hashlib.sha256
-            ).hexdigest()
-            
-            return {
-                "X-MEXC-APIKEY": self.credentials.api_key,
-                "Content-Type": "application/json"
-            }
+        # Set MEXC-specific URLs
+        if config.testnet:
+            self.config.rest_url = "https://sandbox-api.mexc.com"
+            self.config.ws_url = "wss://sandbox-ws.mexc.com/ws"
         else:
-            # Contract API signing
-            request_body = json.dumps(params) if params else ""
-            
-            sign_string = f"{self.credentials.api_key}{timestamp}{request_body}"
-            signature = hmac.new(
-                self.credentials.api_secret.encode('utf-8'),
-                sign_string.encode('utf-8'),
-                hashlib.sha256
-            ).hexdigest()
-            
-            return {
-                "ApiKey": self.credentials.api_key,
-                "Request-Time": timestamp,
-                "Signature": signature,
-                "Content-Type": "application/json"
-            }
-            
-    async def _monitor_new_listings(self) -> None:
-        """Monitor for new token listings"""
-        while True:
-            try:
-                current_time = time.time()
-                
-                # Check every 5 minutes
-                if current_time - self._last_listing_check > 300:
-                    await self._check_new_listings()
-                    self._last_listing_check = current_time
-                    
-                await asyncio.sleep(60)
-                
-            except Exception as e:
-                logger.error(f"Error monitoring new listings: {e}")
-                await asyncio.sleep(300)
-                
-    async def _check_new_listings(self) -> None:
-        """Check for newly listed tokens"""
+            self.config.rest_url = "https://api.mexc.com"
+            self.config.ws_url = "wss://wbs.mexc.com/ws"
+        
+        # Initialize components
+        self.authenticator = MEXCAuthenticator(config)
+        self.spot_trading = MEXCSpotTrading(self)
+        self.futures_trading = MEXCFuturesTrading(self)
+        self.ws_client = MEXCWebSocketClient(self)
+        
+        # Market info
+        self.symbol_info: Dict[str, Any] = {}
+        self.new_listings: List[Dict[str, Any]] = []
+        
+        logger.info("Initialized MEXC client")
+    
+    async def _initialize_exchange(self):
+        """MEXC-specific initialization"""
+        # Load market info
+        await self._load_market_info()
+        
+        # Check for new listings
+        await self._check_new_listings()
+    
+    async def _load_markets(self):
+        """Load MEXC market information"""
+        await self._load_market_info()
+    
+    async def _load_market_info(self):
+        """Load market and symbol information"""
         try:
-            markets = await self.get_markets()
+            # Get spot symbols
+            spot_response = await self._get("/api/v3/exchangeInfo")
             
-            for market in markets:
-                symbol = market.symbol
-                
-                # Check if this is a new symbol
-                if symbol not in self.new_listings:
-                    # Check if trading recently started
-                    # This would need additional API calls to verify
-                    
-                    # For now, mark as potential new listing
-                    self.new_listings[symbol] = datetime.now(timezone.utc)
-                    
-                    # Notify profile for new listing strategy
-                    if await self.profile.should_trade_new_listing(symbol):
-                        logger.info(f"New listing detected: {symbol}")
-                        
+            # Get futures symbols
+            futures_response = await self._get("/contract/v1/detail")
+            
+            # Process spot symbols
+            for symbol_data in spot_response.get('symbols', []):
+                if symbol_data['status'] == 'ENABLED':
+                    symbol = symbol_data['symbol']
+                    self.symbol_info[symbol] = {
+                        'type': 'spot',
+                        'base': symbol_data['baseAsset'],
+                        'quote': symbol_data['quoteAsset'],
+                        'status': symbol_data['status'],
+                        'baseAssetPrecision': symbol_data['baseAssetPrecision'],
+                        'quoteAssetPrecision': symbol_data['quoteAssetPrecision'],
+                        'isSpotTradingAllowed': symbol_data.get('isSpotTradingAllowed', True),
+                        'permissions': symbol_data.get('permissions', [])
+                    }
+            
+            # Process futures symbols
+            if futures_response.get('success'):
+                for contract in futures_response.get('data', []):
+                    symbol = contract['symbol']
+                    self.symbol_info[f"{symbol}_PERP"] = {
+                        'type': 'futures',
+                        'base': contract.get('baseCoin'),
+                        'quote': contract.get('quoteCoin'),
+                        'status': 'ENABLED' if contract.get('state') == 1 else 'DISABLED',
+                        'contractSize': contract.get('contractSize'),
+                        'pricePrecision': contract.get('pricePrecision'),
+                        'volPrecision': contract.get('volPrecision')
+                    }
+            
+            logger.info(f"Loaded {len(self.symbol_info)} symbols from MEXC")
+            
         except Exception as e:
-            logger.error(f"Error checking new listings: {e}")
+            logger.error(f"Failed to load market info: {str(e)}")
+            raise
+    
+    async def _check_new_listings(self):
+        """Check for new token listings"""
+        try:
+            # MEXC provides new listing information through announcements
+            # In production, would parse announcement API or websocket
+            logger.info("Checking for new MEXC listings")
             
-    async def get_markets(self) -> List[MarketInfo]:
-        """Get all available markets on MEXC"""
-        response = await self._make_request("GET", "/api/v3/exchangeInfo")
+            # Store recently listed tokens (last 7 days)
+            # This would be populated from announcement parsing
+            self.new_listings = []
+            
+        except Exception as e:
+            logger.error(f"Failed to check new listings: {str(e)}")
+    
+    async def _check_connection(self):
+        """Check MEXC connection"""
+        # Ping endpoint
+        response = await self._get("/api/v3/ping")
         
-        markets = []
-        for symbol_info in response.get("symbols", []):
-            if symbol_info.get("status") != "ENABLED":
-                continue
-                
-            # Check if it's a spot market
-            if symbol_info.get("contractType"):
-                continue
-                
-            # Parse trading rules
-            base_asset = symbol_info["baseAsset"]
-            quote_asset = symbol_info["quoteAsset"]
-            
-            # Extract limits
-            min_quantity = Decimal(symbol_info.get("baseSizePrecision", "0.00000001"))
-            max_quantity = Decimal(symbol_info.get("maxOrderAmount", "99999999"))
-            quantity_precision = int(symbol_info.get("baseAssetPrecision", 8))
-            
-            min_price = Decimal(symbol_info.get("minOrderPrice", "0.00000001"))
-            max_price = Decimal(symbol_info.get("maxOrderPrice", "99999999"))
-            price_precision = int(symbol_info.get("quotePrecision", 8))
-            
-            min_notional = Decimal(symbol_info.get("minOrderValue", "5"))
-            
-            # Get current price for fee calculation
-            try:
-                ticker = await self.get_ticker(f"{base_asset}{quote_asset}")
-                last_price = ticker.last
-            except:
-                last_price = Decimal("0")
-                
-            market = MarketInfo(
-                symbol=f"{base_asset}{quote_asset}",
-                base_asset=base_asset,
-                quote_asset=quote_asset,
-                min_quantity=min_quantity,
-                max_quantity=max_quantity,
-                quantity_precision=quantity_precision,
-                min_price=min_price,
-                max_price=max_price,
-                price_precision=price_precision,
-                min_notional=min_notional,
-                is_trading=True,
-                maker_fee=Decimal("0.002"),  # 0.2% default
-                taker_fee=Decimal("0.002"),  # 0.2% default
-                last=last_price
+        # Get server time
+        time_response = await self._get("/api/v3/time")
+        server_time = time_response['serverTime']
+        local_time = int(time.time() * 1000)
+        
+        time_diff = abs(server_time - local_time)
+        if time_diff > 5000:  # 5 seconds
+            logger.warning(f"Time sync issue: server time differs by {time_diff}ms")
+    
+    async def _get_auth_headers(
+        self,
+        method: str,
+        endpoint: str,
+        params: Optional[Dict],
+        data: Optional[Dict]
+    ) -> Dict[str, str]:
+        """Generate MEXC authentication headers"""
+        return await self.authenticator.get_auth_headers(method, endpoint, params, data)
+    
+    # Trading methods
+    async def place_order(
+        self,
+        symbol: str,
+        side: str,
+        order_type: OrderType,
+        size: float,
+        price: Optional[float] = None,
+        params: Optional[Dict] = None
+    ) -> Order:
+        """Place an order on MEXC"""
+        # Determine market type
+        if symbol in self.symbol_info and self.symbol_info[symbol]['type'] == 'spot':
+            return await self.spot_trading.place_order(
+                symbol, side, order_type, size, price, params
             )
-            
-            markets.append(market)
-            
-            # Check for MX fee discount
-            if symbol_info.get("mxDeductEnable"):
-                market.maker_fee = Decimal("0.0002")  # 0.02% with MX
-                market.taker_fee = Decimal("0.0002")
-                
-        return markets
+        elif symbol.endswith('_PERP') or (params and params.get('futures', False)):
+            return await self.futures_trading.place_order(
+                symbol, side, order_type, size, price, params
+            )
+        else:
+            # Default to spot for MEXC (altcoin focus)
+            return await self.spot_trading.place_order(
+                symbol, side, order_type, size, price, params
+            )
+    
+    async def cancel_order(self, order_id: str, symbol: Optional[str] = None) -> bool:
+        """Cancel an order"""
+        if not symbol:
+            raise ValueError("Symbol is required for MEXC order cancellation")
         
+        if symbol in self.symbol_info and self.symbol_info[symbol]['type'] == 'spot':
+            return await self.spot_trading.cancel_order(order_id, symbol)
+        else:
+            return await self.futures_trading.cancel_order(order_id, symbol)
+    
+    async def get_order(self, order_id: str, symbol: Optional[str] = None) -> Order:
+        """Get order details"""
+        if not symbol:
+            raise ValueError("Symbol is required for MEXC order query")
+        
+        if symbol in self.symbol_info and self.symbol_info[symbol]['type'] == 'spot':
+            return await self.spot_trading.get_order(order_id, symbol)
+        else:
+            return await self.futures_trading.get_order(order_id, symbol)
+    
+    async def get_open_orders(self, symbol: Optional[str] = None) -> List[Order]:
+        """Get all open orders"""
+        orders = []
+        
+        # Get spot orders
+        spot_orders = await self.spot_trading.get_open_orders(symbol)
+        orders.extend(spot_orders)
+        
+        # Get futures orders if no specific symbol or it's a futures symbol
+        if not symbol or symbol.endswith('_PERP'):
+            futures_orders = await self.futures_trading.get_open_orders(
+                symbol.replace('_PERP', '') if symbol else None
+            )
+            orders.extend(futures_orders)
+        
+        return orders
+    
+    async def get_order_history(
+        self,
+        symbol: Optional[str] = None,
+        limit: int = 100,
+        start_time: Optional[datetime] = None
+    ) -> List[Order]:
+        """Get order history"""
+        if symbol and symbol in self.symbol_info:
+            if self.symbol_info[symbol]['type'] == 'spot':
+                return await self.spot_trading.get_order_history(symbol, limit, start_time)
+            else:
+                return await self.futures_trading.get_order_history(symbol, limit, start_time)
+        else:
+            # Get from both markets
+            orders = []
+            
+            spot_orders = await self.spot_trading.get_order_history(None, limit // 2, start_time)
+            futures_orders = await self.futures_trading.get_order_history(None, limit // 2, start_time)
+            
+            orders.extend(spot_orders)
+            orders.extend(futures_orders)
+            
+            # Sort by timestamp
+            orders.sort(key=lambda x: x.created_at, reverse=True)
+            
+            return orders[:limit]
+    
+    # Market data methods
     async def get_ticker(self, symbol: str) -> Ticker:
-        """Get current ticker for symbol"""
-        response = await self._make_request(
-            "GET",
-            "/api/v3/ticker/24hr",
-            params={"symbol": symbol}
-        )
+        """Get ticker for a symbol"""
+        endpoint = "/api/v3/ticker/24hr"
+        params = {'symbol': self._normalize_symbol(symbol)}
+        
+        data = await self._get(endpoint, params=params)
         
         return Ticker(
-            timestamp=datetime.now(timezone.utc),
             symbol=symbol,
-            bid=Decimal(response.get("bidPrice", "0")),
-            ask=Decimal(response.get("askPrice", "0")),
-            last=Decimal(response.get("lastPrice", "0")),
-            volume_24h=Decimal(response.get("volume", "0")),
-            high_24h=Decimal(response.get("highPrice", "0")),
-            low_24h=Decimal(response.get("lowPrice", "0")),
-            change_24h=Decimal(response.get("priceChangePercent", "0"))
+            bid=float(data.get('bidPrice', 0)),
+            ask=float(data.get('askPrice', 0)),
+            last=float(data.get('lastPrice', 0)),
+            volume_24h=float(data.get('volume', 0)),
+            quote_volume_24h=float(data.get('quoteVolume', 0)),
+            high_24h=float(data.get('highPrice', 0)),
+            low_24h=float(data.get('lowPrice', 0)),
+            change_24h=float(data.get('priceChange', 0)),
+            change_percent_24h=float(data.get('priceChangePercent', 0)),
+            timestamp=datetime.now(timezone.utc)
         )
+    
+    async def get_all_tickers(self) -> Dict[str, Ticker]:
+        """Get all tickers"""
+        endpoint = "/api/v3/ticker/24hr"
         
-    async def get_order_book(self, symbol: str, limit: int = 100) -> OrderBook:
-        """Get order book for symbol"""
-        # MEXC limits: 5, 10, 20, 50, 100, 500, 1000
-        valid_limits = [5, 10, 20, 50, 100, 500, 1000]
-        limit = min(valid_limits, key=lambda x: abs(x - limit))
+        data = await self._get(endpoint)
         
-        response = await self._make_request(
-            "GET",
-            "/api/v3/depth",
-            params={"symbol": symbol, "limit": limit}
-        )
+        tickers = {}
+        for ticker_data in data:
+            symbol = self._denormalize_symbol(ticker_data['symbol'])
+            tickers[symbol] = Ticker(
+                symbol=symbol,
+                bid=float(ticker_data.get('bidPrice', 0)),
+                ask=float(ticker_data.get('askPrice', 0)),
+                last=float(ticker_data.get('lastPrice', 0)),
+                volume_24h=float(ticker_data.get('volume', 0)),
+                quote_volume_24h=float(ticker_data.get('quoteVolume', 0)),
+                high_24h=float(ticker_data.get('highPrice', 0)),
+                low_24h=float(ticker_data.get('lowPrice', 0)),
+                change_24h=float(ticker_data.get('priceChange', 0)),
+                change_percent_24h=float(ticker_data.get('priceChangePercent', 0)),
+                timestamp=datetime.now(timezone.utc)
+            )
         
-        bids = [(Decimal(b[0]), Decimal(b[1])) for b in response.get("bids", [])]
-        asks = [(Decimal(a[0]), Decimal(a[1])) for a in response.get("asks", [])]
+        return tickers
+    
+    async def get_order_book(self, symbol: str, limit: int = 20) -> OrderBook:
+        """Get order book"""
+        endpoint = "/api/v3/depth"
+        params = {
+            'symbol': self._normalize_symbol(symbol),
+            'limit': limit
+        }
+        
+        data = await self._get(endpoint, params=params)
         
         return OrderBook(
-            timestamp=datetime.now(timezone.utc),
             symbol=symbol,
-            bids=bids,
-            asks=asks
+            bids=[(float(price), float(size)) for price, size in data.get('bids', [])],
+            asks=[(float(price), float(size)) for price, size in data.get('asks', [])],
+            timestamp=datetime.now(timezone.utc)
         )
-        
-    async def get_balance(self) -> List[Balance]:
-        """Get account balances"""
-        response = await self._make_request(
-            "GET",
-            "/api/v3/account",
-            signed=True
-        )
-        
-        balances = []
-        for balance_data in response.get("balances", []):
-            free = Decimal(balance_data.get("free", "0"))
-            locked = Decimal(balance_data.get("locked", "0"))
-            
-            if free > 0 or locked > 0:
-                balance = Balance(
-                    asset=balance_data["asset"],
-                    free=free,
-                    locked=locked,
-                    total=free + locked
-                )
-                balances.append(balance)
-                
-        return balances
-        
-    async def place_order(self, order: Order) -> Dict[str, Any]:
-        """Place new order on MEXC"""
-        # Apply retail behavior
-        await self.profile.pre_order_behavior(order)
-        
-        # Check if this might be a new listing
-        if order.symbol in self.new_listings:
-            listing_time = self.new_listings[order.symbol]
-            time_since_listing = (datetime.now(timezone.utc) - listing_time).total_seconds()
-            
-            # Special handling for new listings (first hour)
-            if time_since_listing < 3600:
-                order = await self.profile.adjust_for_new_listing(order, time_since_listing)
-                
-        # Validate order
-        valid, error = self.validate_order(order)
-        if not valid:
-            raise OrderExecutionError(f"Order validation failed: {error}", order.order_id, self.name)
-            
-        # Prepare order parameters
+    
+    async def get_candles(
+        self,
+        symbol: str,
+        timeframe: str,
+        limit: int = 100,
+        start_time: Optional[datetime] = None
+    ) -> List[Candle]:
+        """Get candlestick data"""
+        endpoint = "/api/v3/klines"
         params = {
-            "symbol": order.symbol,
-            "side": order.side.value,
-            "type": MEXC_ORDER_TYPES.get(order.order_type, "LIMIT"),
-            "quantity": str(self.round_quantity(order.symbol, order.quantity))
+            'symbol': self._normalize_symbol(symbol),
+            'interval': self._convert_timeframe(timeframe),
+            'limit': limit
         }
         
-        # Add order type specific parameters
-        if order.order_type == OrderType.LIMIT:
-            params["price"] = str(self.round_price(order.symbol, order.price))
-            params["timeInForce"] = MEXC_TIF.get(order.time_in_force, "GTC")
-            
-            if order.post_only:
-                params["type"] = "LIMIT_MAKER"
-                
-        elif order.order_type in [OrderType.STOP_LOSS, OrderType.TAKE_PROFIT]:
-            # MEXC stop orders
-            params["stopPrice"] = str(self.round_price(order.symbol, order.stop_price))
-            if order.price:
-                params["price"] = str(self.round_price(order.symbol, order.price))
-                
-        # Place order
-        try:
-            response = await self._make_request(
-                "POST",
-                "/api/v3/order",
-                params=params,
-                signed=True
-            )
-            
-            # Apply post-order behavior
-            await self.profile.post_order_behavior(order, response)
-            
-            return {
-                "order_id": order.order_id,
-                "exchange_order_id": str(response.get("orderId")),
-                "symbol": response.get("symbol"),
-                "status": normalize_order_status(response.get("status")),
-                "filled_quantity": Decimal(response.get("executedQty", "0")),
-                "created_at": datetime.fromtimestamp(response.get("transactTime", 0) / 1000, tz=timezone.utc)
-            }
-            
-        except Exception as e:
-            logger.error(f"Failed to place order on MEXC: {e}")
-            raise OrderExecutionError(str(e), order.order_id, self.name)
-            
-    async def cancel_order(self, order_id: str, symbol: str) -> Dict[str, Any]:
-        """Cancel existing order"""
-        # MEXC requires orderId, not clientOrderId
-        # First, we need to find the order
-        open_orders = await self.get_open_orders(symbol)
+        if start_time:
+            params['startTime'] = int(start_time.timestamp() * 1000)
         
-        exchange_order_id = None
-        for open_order in open_orders:
-            if open_order.get("order_id") == order_id:
-                exchange_order_id = open_order.get("exchange_order_id")
-                break
-                
-        if not exchange_order_id:
-            raise OrderExecutionError(f"Order {order_id} not found", order_id, self.name)
-            
+        data = await self._get(endpoint, params=params)
+        
+        candles = []
+        for candle_data in data:
+            candles.append(Candle(
+                symbol=symbol,
+                timeframe=timeframe,
+                open_time=datetime.fromtimestamp(candle_data[0] / 1000, tz=timezone.utc),
+                close_time=datetime.fromtimestamp(candle_data[6] / 1000, tz=timezone.utc),
+                open=float(candle_data[1]),
+                high=float(candle_data[2]),
+                low=float(candle_data[3]),
+                close=float(candle_data[4]),
+                volume=float(candle_data[5]),
+                quote_volume=float(candle_data[7]),
+                trades=int(candle_data[8])
+            ))
+        
+        return candles
+    
+    async def get_trades(self, symbol: str, limit: int = 100) -> List[Trade]:
+        """Get recent trades"""
+        endpoint = "/api/v3/trades"
         params = {
-            "symbol": symbol,
-            "orderId": exchange_order_id
+            'symbol': self._normalize_symbol(symbol),
+            'limit': limit
         }
         
-        response = await self._make_request(
-            "DELETE",
-            "/api/v3/order",
-            params=params,
-            signed=True
-        )
-        
-        return {
-            "order_id": order_id,
-            "exchange_order_id": exchange_order_id,
-            "status": "CANCELLED",
-            "cancelled_at": datetime.now(timezone.utc)
-        }
-        
-    async def get_order_status(self, order_id: str, symbol: str) -> Dict[str, Any]:
-        """Get order status"""
-        # Find order by client order id
-        params = {
-            "symbol": symbol
-        }
-        
-        response = await self._make_request(
-            "GET",
-            "/api/v3/allOrders",
-            params=params,
-            signed=True
-        )
-        
-        for order_data in response:
-            if order_data.get("clientOrderId") == order_id:
-                return {
-                    "order_id": order_id,
-                    "exchange_order_id": str(order_data.get("orderId")),
-                    "status": normalize_order_status(order_data.get("status")),
-                    "filled_quantity": Decimal(order_data.get("executedQty", "0")),
-                    "average_price": Decimal(order_data.get("avgPrice", "0"))
-                }
-                
-        return {
-            "order_id": order_id,
-            "status": "UNKNOWN"
-        }
-        
-    async def get_open_orders(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Get all open orders"""
-        params = {}
-        if symbol:
-            params["symbol"] = symbol
-            
-        response = await self._make_request(
-            "GET",
-            "/api/v3/openOrders",
-            params=params,
-            signed=True
-        )
-        
-        orders = []
-        for order_data in response:
-            orders.append({
-                "order_id": order_data.get("clientOrderId", str(order_data.get("orderId"))),
-                "exchange_order_id": str(order_data.get("orderId")),
-                "symbol": order_data.get("symbol"),
-                "side": order_data.get("side"),
-                "type": order_data.get("type"),
-                "status": normalize_order_status(order_data.get("status")),
-                "quantity": Decimal(order_data.get("origQty", "0")),
-                "filled_quantity": Decimal(order_data.get("executedQty", "0")),
-                "price": Decimal(order_data.get("price", "0")),
-                "stop_price": Decimal(order_data.get("stopPrice", "0")),
-                "created_at": datetime.fromtimestamp(order_data.get("time", 0) / 1000, tz=timezone.utc)
-            })
-            
-        return orders
-        
-    async def get_recent_trades(self, symbol: str, limit: int = 100) -> List[Dict[str, Any]]:
-        """Get recent trades for market analysis"""
-        response = await self._make_request(
-            "GET",
-            "/api/v3/trades",
-            params={"symbol": symbol, "limit": limit}
-        )
+        data = await self._get(endpoint, params=params)
         
         trades = []
-        for trade in response:
-            trades.append({
-                "trade_id": trade.get("id"),
-                "price": Decimal(trade.get("price", "0")),
-                "quantity": Decimal(trade.get("qty", "0")),
-                "time": datetime.fromtimestamp(trade.get("time", 0) / 1000, tz=timezone.utc),
-                "is_buyer_maker": trade.get("isBuyerMaker", False)
-            })
-            
+        for trade_data in data:
+            trades.append(Trade(
+                trade_id=str(trade_data.get('id', '')),
+                order_id="",  # Not provided in public trades
+                symbol=symbol,
+                side=OrderSide.BUY if trade_data.get('isBuyerMaker') else OrderSide.SELL,
+                price=float(trade_data.get('price', 0)),
+                size=float(trade_data.get('qty', 0)),
+                fee=0.0,  # Not provided in public trades
+                fee_currency="",
+                timestamp=datetime.fromtimestamp(trade_data.get('time', 0) / 1000, tz=timezone.utc),
+                is_maker=trade_data.get('isBuyerMaker', False)
+            ))
+        
         return trades
-        
-    async def subscribe_ticker(self, symbol: str) -> AsyncGenerator[Ticker, None]:
-        """Subscribe to ticker updates via WebSocket"""
-        # Subscribe to ticker stream
-        subscribe_msg = {
-            "method": "SUBSCRIPTION",
-            "params": [f"spot@public.miniTicker.v3.api@{symbol}"]
-        }
-        
-        await self.spot_ws.send(subscribe_msg)
-        
-        async for message in self.spot_ws.receive():
-            if message.get("c") == f"spot@public.miniTicker.v3.api@{symbol}":
-                data = message.get("d", {})
-                
-                yield Ticker(
-                    timestamp=datetime.fromtimestamp(data.get("t", 0) / 1000, tz=timezone.utc),
-                    symbol=symbol,
-                    bid=Decimal(data.get("b", "0")),
-                    ask=Decimal(data.get("a", "0")),
-                    last=Decimal(data.get("c", "0")),
-                    volume_24h=Decimal(data.get("v", "0")),
-                    high_24h=Decimal(data.get("h", "0")),
-                    low_24h=Decimal(data.get("l", "0")),
-                    change_24h=Decimal(data.get("p", "0"))
-                )
-                
-    async def subscribe_order_book(self, symbol: str) -> AsyncGenerator[OrderBook, None]:
-        """Subscribe to order book updates via WebSocket"""
-        # Create order book manager
-        if symbol not in self.order_books:
-            self.order_books[symbol] = OrderBookManager(symbol)
-            
-        manager = self.order_books[symbol]
-        
-        # Get initial snapshot
-        snapshot = await self.get_order_book(symbol)
-        manager.update_snapshot(
-            [[str(p), str(q)] for p, q in snapshot.bids],
-            [[str(p), str(q)] for p, q in snapshot.asks]
-        )
-        
-        # Subscribe to depth updates
-        subscribe_msg = {
-            "method": "SUBSCRIPTION",
-            "params": [f"spot@public.bookTicker.v3.api@{symbol}"]
-        }
-        
-        await self.spot_ws.send(subscribe_msg)
-        
-        async for message in self.spot_ws.receive():
-            if message.get("c") == f"spot@public.bookTicker.v3.api@{symbol}":
-                data = message.get("d", {})
-                
-                # Update best bid/ask
-                # For full depth, would need to subscribe to depth stream
-                yield OrderBook(
-                    timestamp=datetime.now(timezone.utc),
-                    symbol=symbol,
-                    bids=[(Decimal(data.get("b", "0")), Decimal(data.get("B", "0")))],
-                    asks=[(Decimal(data.get("a", "0")), Decimal(data.get("A", "0")))]
-                )
-                
-    async def subscribe_trades(self, symbol: str) -> AsyncGenerator[Dict[str, Any], None]:
-        """Subscribe to trade updates via WebSocket"""
-        subscribe_msg = {
-            "method": "SUBSCRIPTION",
-            "params": [f"spot@public.trade.v3.api@{symbol}"]
-        }
-        
-        await self.spot_ws.send(subscribe_msg)
-        
-        async for message in self.spot_ws.receive():
-            if message.get("c") == f"spot@public.trade.v3.api@{symbol}":
-                data = message.get("d", {})
-                
-                yield {
-                    "trade_id": data.get("t"),
-                    "timestamp": datetime.fromtimestamp(data.get("T", 0) / 1000, tz=timezone.utc),
-                    "symbol": symbol,
-                    "price": Decimal(data.get("p", "0")),
-                    "quantity": Decimal(data.get("q", "0")),
-                    "is_buyer_maker": data.get("m", False)
-                }
-
-
-class MEXCFuturesExchange(MEXCExchange):
-    """
-    MEXC Futures implementation
-    """
     
-    def __init__(self, credentials: ExchangeCredentials, **kwargs):
-        super().__init__(credentials, **kwargs)
+    # Account methods
+    async def get_balance(self) -> Dict[str, Balance]:
+        """Get account balance"""
+        balances = {}
         
-        self.base_url = self.contract_url
-        self.ws_url = "wss://contract.mexc.com/ws"
+        # Get spot balances
+        spot_balances = await self.spot_trading.get_balance()
+        balances.update(spot_balances)
         
-    async def get_futures_markets(self) -> List[Dict[str, Any]]:
-        """Get futures market information"""
-        response = await self._make_request("GET", "/api/v1/contract/detail")
+        # Get futures balances
+        futures_balances = await self.futures_trading.get_balance()
+        balances.update(futures_balances)
         
-        markets = []
-        for contract in response.get("data", []):
-            markets.append({
-                "symbol": contract["symbol"],
-                "contract_size": Decimal(contract["contractSize"]),
-                "price_unit": Decimal(contract["priceUnit"]),
-                "vol_unit": Decimal(contract["volUnit"]),
-                "min_leverage": contract["minLeverage"],
-                "max_leverage": contract["maxLeverage"],
-                "maintenance_margin_rate": Decimal(contract["maintainMarginRate"])
-            })
+        return balances
+    
+    async def get_open_positions(self) -> List[Position]:
+        """Get open positions (futures only)"""
+        return await self.futures_trading.get_open_positions()
+    
+    async def get_position(self, symbol: str) -> Optional[Position]:
+        """Get specific position"""
+        return await self.futures_trading.get_position(symbol)
+    
+    # MEXC specific methods
+    async def get_new_listings(self, days: int = 7) -> List[Dict[str, Any]]:
+        """Get recently listed tokens"""
+        # In production, this would parse announcement data
+        # or use a dedicated new listings API
+        return self.new_listings
+    
+    async def get_hot_tokens(self, limit: int = 20) -> List[str]:
+        """Get trending/hot tokens on MEXC"""
+        try:
+            # Get all tickers
+            tickers = await self.get_all_tickers()
             
-        return markets
-        
-    async def set_leverage(self, symbol: str, leverage: int) -> Dict[str, Any]:
-        """Set leverage for futures trading"""
-        params = {
-            "symbol": symbol,
-            "leverage": leverage,
-            "openType": 2  # Cross margin
-        }
-        
-        response = await self._make_request(
-            "POST",
-            "/api/v1/private/position/change_leverage",
-            params=params,
-            signed=True
+            # Sort by volume and price change
+            hot_tokens = sorted(
+                tickers.items(),
+                key=lambda x: x[1].quote_volume_24h * abs(x[1].change_percent_24h),
+                reverse=True
+            )
+            
+            return [symbol for symbol, _ in hot_tokens[:limit]]
+            
+        except Exception as e:
+            logger.error(f"Failed to get hot tokens: {str(e)}")
+            return []
+    
+    # WebSocket methods
+    async def _connect_websocket(self):
+        """Connect to MEXC WebSocket"""
+        await self.ws_client.connect(
+            on_message=self.ws_on_message,
+            on_error=self.ws_on_error,
+            on_close=self.ws_on_close
         )
-        
-        return {
-            "symbol": symbol,
-            "leverage": response.get("data", {}).get("leverage", leverage)
+    
+    async def subscribe_ticker(self, symbol: str):
+        """Subscribe to ticker updates"""
+        await self.ws_client.subscribe_ticker(symbol)
+    
+    async def subscribe_orderbook(self, symbol: str, depth: int = 20):
+        """Subscribe to order book updates"""
+        await self.ws_client.subscribe_orderbook(symbol, depth)
+    
+    async def subscribe_trades(self, symbol: str):
+        """Subscribe to trade updates"""
+        await self.ws_client.subscribe_trades(symbol)
+    
+    async def subscribe_user_orders(self):
+        """Subscribe to user order updates"""
+        await self.ws_client.subscribe_user_data()
+    
+    async def subscribe_user_positions(self):
+        """Subscribe to user position updates"""
+        await self.ws_client.subscribe_user_data()
+    
+    # Helper methods
+    def _convert_timeframe(self, timeframe: str) -> str:
+        """Convert standard timeframe to MEXC format"""
+        timeframe_map = {
+            '1m': '1m',
+            '5m': '5m',
+            '15m': '15m',
+            '30m': '30m',
+            '1h': '1h',
+            '4h': '4h',
+            '1d': '1d',
+            '1w': '1w',
+            '1M': '1M'
         }
+        return timeframe_map.get(timeframe, timeframe)

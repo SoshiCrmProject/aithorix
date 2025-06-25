@@ -1,5 +1,7 @@
-"""OKX exchange module"""
+"""
+AITHORIX OKX Exchange Module
+"""
 
-from .client import OKXExchange
+from .client import OKXClient
 
-__all__ = ["OKXExchange"]
+__all__ = ['OKXClient']

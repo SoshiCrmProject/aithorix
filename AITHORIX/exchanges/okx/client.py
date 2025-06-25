@@ -1,710 +1,472 @@
 """
-AITHORIX OKX Exchange Implementation
-Full production implementation with unified account and multi-product support
+AITHORIX OKX Client Implementation
+Exchange known for unified trading and copy trading features
 """
 
 import asyncio
+import logging
+from datetime import datetime, timezone
+from typing import Dict, List, Optional, Any, Callable
 import time
 import hmac
 import hashlib
 import base64
-from datetime import datetime, timezone
-from decimal import Decimal
-from typing import Dict, List, Optional, Any, AsyncGenerator
 from urllib.parse import urlencode
-import json
 
 from ..base_exchange import (
-    BaseExchange, ExchangeCredentials, MarketInfo, 
-    OrderBook, Ticker, Balance, WebSocketManager, OrderBookManager
+    BaseExchange, ExchangeConfig, Order, Trade, Position,
+    Balance, Ticker, OrderBook, Candle, OrderType, OrderSide,
+    OrderStatus, TimeInForce, PositionSide
 )
-from ..common import (
-    OKX_ORDER_TYPES, OKX_TIF,
-    get_timestamp, normalize_order_status
-)
-from ...core.engine.trading_engine import Order, OrderType, OrderSide, OrderStatus
-from ...core.exceptions import (
-    ExchangeConnectionError, OrderExecutionError,
-    AuthenticationError
-)
-from ...stealth.profiles.okx_asian import OKXAsianProfile
+from .unified.unified_trading import OKXUnifiedTrading
+from .websocket.ws_client import OKXWebSocketClient
+from .auth.authenticator import OKXAuthenticator
+
+logger = logging.getLogger(__name__)
 
 
-class OKXExchange(BaseExchange):
+class OKXClient(BaseExchange):
     """
-    OKX exchange implementation
-    Multi-product platform with unified account
+    OKX exchange client implementation
+    Focus on unified trading and copy trading
     """
     
-    def __init__(self, credentials: ExchangeCredentials, **kwargs):
-        super().__init__(credentials, **kwargs)
+    def __init__(self, config: ExchangeConfig):
+        super().__init__(config)
         
-        self.name = "okx"
-        self.base_url = "https://www.okx.com"
-        self.ws_url = "wss://ws.okx.com:8443/ws/v5/public"
-        self.private_ws_url = "wss://ws.okx.com:8443/ws/v5/private"
-        
-        # OKX requires passphrase
-        self.passphrase = getattr(credentials, 'passphrase', '')
-        if not self.passphrase:
-            raise ConfigurationError("okx", "Passphrase required for OKX")
-            
-        # Rate limits
-        self.rate_limits = {
-            "default": 20,    # requests per 2 seconds
-            "orders": 60,     # orders per 2 seconds
-            "heavy": 2        # heavy endpoints per 2 seconds
-        }
-        
-        # OKX specific features
-        self.account_mode = "unified"  # or "simple"
-        self.position_mode = "net_mode"  # or "long_short_mode"
-        self.supports_copy_trading = True
-        self.supports_grid_trading = True
-        self.supports_recurring_buy = True
-        
-        # WebSocket managers
-        self.public_ws: Optional[WebSocketManager] = None
-        self.private_ws: Optional[WebSocketManager] = None
-        
-        # Apply Asian timezone profile
-        self.profile = OKXAsianProfile()
-        
-        # Grid trading bots tracking
-        self.active_grids: Dict[str, Dict[str, Any]] = {}
-        
-    async def connect(self) -> None:
-        """Initialize OKX connection"""
-        await super().connect()
-        
-        # Initialize WebSocket connections
-        self.public_ws = WebSocketManager(self.ws_url)
-        await self.public_ws.connect()
-        
-        # Authenticate and connect private WebSocket
-        await self._connect_private_ws()
-        
-        # Configure account settings
-        await self._configure_account()
-        
-        # Start grid trading monitor if enabled
-        if self.supports_grid_trading:
-            asyncio.create_task(self._monitor_grid_trading())
-            
-    async def disconnect(self) -> None:
-        """Close OKX connections"""
-        if self.public_ws:
-            await self.public_ws.disconnect()
-        if self.private_ws:
-            await self.private_ws.disconnect()
-            
-        await super().disconnect()
-        
-    def _sign_request(self, method: str, path: str, params: Dict[str, Any]) -> Dict[str, str]:
-        """Sign request for OKX API"""
-        timestamp = datetime.utcnow().isoformat("T", "milliseconds") + "Z"
-        
-        # Create sign string
-        if method == "GET":
-            if params:
-                path = path + "?" + urlencode(sorted(params.items()))
-            body = ""
+        # Set OKX-specific URLs
+        if config.testnet:
+            self.config.rest_url = "https://www.okx.com"  # OKX uses same URL for testnet with different headers
+            self.config.ws_public_url = "wss://wspap.okx.com:8443/ws/v5/public?brokerId=9999"
+            self.config.ws_private_url = "wss://wspap.okx.com:8443/ws/v5/private?brokerId=9999"
         else:
-            body = json.dumps(params) if params else ""
-            
-        message = timestamp + method + path + body
+            self.config.rest_url = "https://www.okx.com"
+            self.config.ws_public_url = "wss://ws.okx.com:8443/ws/v5/public"
+            self.config.ws_private_url = "wss://ws.okx.com:8443/ws/v5/private"
         
-        # Create signature
-        mac = hmac.new(
-            self.credentials.api_secret.encode('utf-8'),
-            message.encode('utf-8'),
-            hashlib.sha256
-        )
-        signature = base64.b64encode(mac.digest()).decode()
+        # Initialize components
+        self.authenticator = OKXAuthenticator(config)
+        self.unified_trading = OKXUnifiedTrading(self)
+        self.ws_client = OKXWebSocketClient(self)
         
-        return {
-            "OK-ACCESS-KEY": self.credentials.api_key,
-            "OK-ACCESS-SIGN": signature,
-            "OK-ACCESS-TIMESTAMP": timestamp,
-            "OK-ACCESS-PASSPHRASE": self.passphrase,
-            "Content-Type": "application/json"
-        }
+        # Market info
+        self.instruments: Dict[str, Any] = {}
+        self.symbol_info: Dict[str, Any] = {}
         
-    async def _connect_private_ws(self) -> None:
-        """Connect to private WebSocket for account updates"""
+        # Account configuration
+        self.account_level = config.params.get('account_level', 'Unified account')  # Simple, Single-currency margin, Multi-currency margin, Portfolio margin
+        self.position_mode = config.params.get('position_mode', 'net_mode')  # net_mode, long_short_mode
+        
+        logger.info("Initialized OKX client")
+    
+    async def _initialize_exchange(self):
+        """OKX-specific initialization"""
+        # Load instruments
+        await self._load_instruments()
+        
+        # Check account configuration
+        await self._check_account_config()
+    
+    async def _load_markets(self):
+        """Load OKX market information"""
+        await self._load_instruments()
+    
+    async def _load_instruments(self):
+        """Load all tradeable instruments"""
         try:
-            # Generate auth for WebSocket
-            timestamp = str(int(time.time()))
-            message = timestamp + "GET" + "/users/self/verify"
+            # Get all instrument types
+            inst_types = ['SPOT', 'SWAP', 'FUTURES', 'OPTION']
             
-            mac = hmac.new(
-                self.credentials.api_secret.encode('utf-8'),
-                message.encode('utf-8'),
-                hashlib.sha256
-            )
-            signature = base64.b64encode(mac.digest()).decode()
-            
-            # Connect and authenticate
-            self.private_ws = WebSocketManager(self.private_ws_url)
-            await self.private_ws.connect()
-            
-            auth_msg = {
-                "op": "login",
-                "args": [{
-                    "apiKey": self.credentials.api_key,
-                    "passphrase": self.passphrase,
-                    "timestamp": timestamp,
-                    "sign": signature
-                }]
-            }
-            
-            await self.private_ws.send(auth_msg)
-            
-            # Wait for auth confirmation
-            await asyncio.sleep(1)
-            
-            # Subscribe to private channels
-            await self._subscribe_private_channels()
-            
-            # Start processing private updates
-            asyncio.create_task(self._process_private_stream())
-            
-        except Exception as e:
-            logger.error(f"Failed to connect private WebSocket: {e}")
-            
-    async def _subscribe_private_channels(self) -> None:
-        """Subscribe to private account channels"""
-        subscriptions = {
-            "op": "subscribe",
-            "args": [
-                {"channel": "account"},
-                {"channel": "positions", "instType": "SWAP"},
-                {"channel": "orders", "instType": "ANY"},
-                {"channel": "orders-algo", "instType": "ANY"}
-            ]
-        }
-        
-        await self.private_ws.send(subscriptions)
-        
-    async def _process_private_stream(self) -> None:
-        """Process private WebSocket updates"""
-        if not self.private_ws:
-            return
-            
-        async for message in self.private_ws.receive():
-            try:
-                if message.get("event") == "error":
-                    logger.error(f"WebSocket error: {message}")
-                    continue
-                    
-                arg = message.get("arg", {})
-                channel = arg.get("channel")
-                data = message.get("data", [])
-                
-                if channel == "account":
-                    await self._handle_account_update(data)
-                elif channel == "positions":
-                    await self._handle_position_update(data)
-                elif channel == "orders":
-                    await self._handle_order_update(data)
-                elif channel == "orders-algo":
-                    await self._handle_algo_order_update(data)
-                    
-            except Exception as e:
-                logger.error(f"Error processing private stream: {e}")
-                
-    async def _handle_account_update(self, data: List[Dict[str, Any]]) -> None:
-        """Handle account balance updates"""
-        for update in data:
-            # Update internal balance cache
-            logger.debug(f"Account update: {update}")
-            
-    async def _handle_position_update(self, data: List[Dict[str, Any]]) -> None:
-        """Handle position updates"""
-        for position in data:
-            logger.debug(f"Position update: {position}")
-            
-    async def _handle_order_update(self, data: List[Dict[str, Any]]) -> None:
-        """Handle order updates"""
-        for order in data:
-            logger.info(f"Order update: {order}")
-            
-    async def _handle_algo_order_update(self, data: List[Dict[str, Any]]) -> None:
-        """Handle algorithmic order updates"""
-        for algo_order in data:
-            logger.info(f"Algo order update: {algo_order}")
-            
-    async def _configure_account(self) -> None:
-        """Configure account settings"""
-        try:
-            # Set account mode
-            await self._make_request(
-                "POST",
-                "/api/v5/account/set-account-level",
-                params={"acctLv": "2"},  # Unified account
-                signed=True
-            )
-            
-            # Set position mode
-            await self._make_request(
-                "POST",
-                "/api/v5/account/set-position-mode",
-                params={"posMode": self.position_mode},
-                signed=True
-            )
-            
-        except Exception as e:
-            logger.warning(f"Failed to configure account: {e}")
-            
-    async def _monitor_grid_trading(self) -> None:
-        """Monitor grid trading bots"""
-        while True:
-            try:
-                # Get active grid bots
-                response = await self._make_request(
-                    "GET",
-                    "/api/v5/tradingBot/grid/orders-algo-pending",
-                    params={"algoOrdType": "grid"},
-                    signed=True
+            for inst_type in inst_types:
+                response = await self._get(
+                    "/api/v5/public/instruments",
+                    params={'instType': inst_type}
                 )
                 
-                for grid in response.get("data", []):
-                    algo_id = grid.get("algoId")
-                    self.active_grids[algo_id] = grid
-                    
-                await asyncio.sleep(300)  # Check every 5 minutes
-                
-            except Exception as e:
-                logger.error(f"Error monitoring grid trading: {e}")
-                await asyncio.sleep(600)
-                
-    async def get_markets(self) -> List[MarketInfo]:
-        """Get all available markets on OKX"""
-        all_markets = []
-        
-        # Get different instrument types
-        inst_types = ["SPOT", "SWAP", "FUTURES", "OPTION"]
-        
-        for inst_type in inst_types:
-            response = await self._make_request(
-                "GET",
-                "/api/v5/public/instruments",
-                params={"instType": inst_type}
-            )
+                if response['code'] == '0':
+                    for inst in response['data']:
+                        symbol = inst['instId']
+                        
+                        self.instruments[symbol] = {
+                            'instType': inst['instType'],
+                            'instId': inst['instId'],
+                            'uly': inst.get('uly'),  # Underlying
+                            'baseCcy': inst.get('baseCcy'),
+                            'quoteCcy': inst.get('quoteCcy'),
+                            'settleCcy': inst.get('settleCcy'),
+                            'ctVal': float(inst.get('ctVal', 1)),  # Contract value
+                            'ctMult': float(inst.get('ctMult', 1)),  # Contract multiplier
+                            'ctValCcy': inst.get('ctValCcy'),  # Contract value currency
+                            'tickSz': float(inst['tickSz']),
+                            'lotSz': float(inst['lotSz']),
+                            'minSz': float(inst['minSz']),
+                            'lever': inst.get('lever'),
+                            'state': inst['state'],
+                            'listTime': inst.get('listTime'),
+                            'expTime': inst.get('expTime'),
+                            'optType': inst.get('optType'),  # Option type
+                            'stk': inst.get('stk'),  # Strike price
+                            'ctType': inst.get('ctType')  # Contract type: linear, inverse
+                        }
+                        
+                        self.symbol_info[symbol] = self.instruments[symbol]
             
-            for instrument in response.get("data", []):
-                if instrument.get("state") != "live":
-                    continue
-                    
-                # Parse instrument details
-                if inst_type == "SPOT":
-                    base_asset = instrument["baseCcy"]
-                    quote_asset = instrument["quoteCcy"]
-                    symbol = f"{base_asset}-{quote_asset}"
-                else:
-                    symbol = instrument["instId"]
-                    base_asset = instrument.get("ctValCcy", instrument.get("baseCcy", ""))
-                    quote_asset = instrument.get("quoteCcy", "USDT")
-                    
-                market = MarketInfo(
-                    symbol=symbol,
-                    base_asset=base_asset,
-                    quote_asset=quote_asset,
-                    min_quantity=Decimal(instrument.get("minSz", "0")),
-                    max_quantity=Decimal(instrument.get("maxLmtSz", "999999999")),
-                    quantity_precision=len(instrument.get("lotSz", "0.00000001").split(".")[-1].rstrip("0")),
-                    min_price=Decimal("0.00000001"),
-                    max_price=Decimal("999999999"),
-                    price_precision=len(instrument.get("tickSz", "0.00000001").split(".")[-1].rstrip("0")),
-                    min_notional=Decimal("1"),  # $1 minimum
-                    is_trading=True,
-                    maker_fee=Decimal("0.0008"),  # 0.08% default
-                    taker_fee=Decimal("0.001"),   # 0.1% default
-                    last=Decimal("0")
-                )
-                
-                # Add instrument type
-                market.instrument_type = inst_type
-                
-                all_markets.append(market)
-                
-        return all_markets
-        
-    async def get_ticker(self, symbol: str) -> Ticker:
-        """Get current ticker for symbol"""
-        response = await self._make_request(
-            "GET",
-            "/api/v5/market/ticker",
-            params={"instId": symbol}
-        )
-        
-        ticker_data = response.get("data", [{}])[0]
-        
-        return Ticker(
-            timestamp=datetime.fromtimestamp(int(ticker_data.get("ts", 0)) / 1000, tz=timezone.utc),
-            symbol=symbol,
-            bid=Decimal(ticker_data.get("bidPx", "0")),
-            ask=Decimal(ticker_data.get("askPx", "0")),
-            last=Decimal(ticker_data.get("last", "0")),
-            volume_24h=Decimal(ticker_data.get("vol24h", "0")),
-            high_24h=Decimal(ticker_data.get("high24h", "0")),
-            low_24h=Decimal(ticker_data.get("low24h", "0")),
-            change_24h=Decimal(ticker_data.get("instId", "0"))  # Percentage
-        )
-        
-    async def get_order_book(self, symbol: str, limit: int = 100) -> OrderBook:
-        """Get order book for symbol"""
-        # OKX limits: 1-400
-        limit = min(400, max(1, limit))
-        
-        response = await self._make_request(
-            "GET",
-            "/api/v5/market/books",
-            params={"instId": symbol, "sz": str(limit)}
-        )
-        
-        book_data = response.get("data", [{}])[0]
-        
-        bids = [
-            (Decimal(bid[0]), Decimal(bid[1]))
-            for bid in book_data.get("bids", [])
-        ]
-        
-        asks = [
-            (Decimal(ask[0]), Decimal(ask[1]))
-            for ask in book_data.get("asks", [])
-        ]
-        
-        return OrderBook(
-            timestamp=datetime.fromtimestamp(int(book_data.get("ts", 0)) / 1000, tz=timezone.utc),
-            symbol=symbol,
-            bids=bids,
-            asks=asks
-        )
-        
-    async def get_balance(self) -> List[Balance]:
-        """Get account balances"""
-        response = await self._make_request(
-            "GET",
-            "/api/v5/account/balance",
-            signed=True
-        )
-        
-        balances = []
-        
-        for account_data in response.get("data", []):
-            for detail in account_data.get("details", []):
-                available = Decimal(detail.get("availBal", "0"))
-                frozen = Decimal(detail.get("frozenBal", "0"))
-                
-                if available > 0 or frozen > 0:
-                    balance = Balance(
-                        asset=detail["ccy"],
-                        free=available,
-                        locked=frozen,
-                        total=available + frozen
-                    )
-                    balances.append(balance)
-                    
-        return balances
-        
-    async def place_order(self, order: Order) -> Dict[str, Any]:
-        """Place new order on OKX"""
-        # Apply Asian trading behavior
-        await self.profile.pre_order_behavior(order)
-        
-        # Validate order
-        valid, error = self.validate_order(order)
-        if not valid:
-            raise OrderExecutionError(f"Order validation failed: {error}", order.order_id, self.name)
-            
-        # Determine trade mode (cash, cross, isolated)
-        td_mode = "cash" if "-" in order.symbol and "SWAP" not in order.symbol else "cross"
-        
-        # Prepare order parameters
-        params = {
-            "instId": order.symbol,
-            "tdMode": td_mode,
-            "side": "buy" if order.side == OrderSide.BUY else "sell",
-            "ordType": OKX_ORDER_TYPES.get(order.order_type, "limit"),
-            "sz": str(self.round_quantity(order.symbol, order.quantity)),
-            "clOrdId": order.order_id[:32]  # OKX limit
-        }
-        
-        # Position side for derivatives
-        if "SWAP" in order.symbol or "FUTURES" in order.symbol:
-            if self.position_mode == "long_short_mode":
-                params["posSide"] = "long" if order.side == OrderSide.BUY else "short"
-            else:
-                params["posSide"] = "net"
-                
-        # Add order type specific parameters
-        if order.order_type == OrderType.LIMIT:
-            params["px"] = str(self.round_price(order.symbol, order.price))
-            
-            # Time in force
-            if order.post_only:
-                params["ordType"] = "post_only"
-            else:
-                params["tgtCcy"] = ""  # Default
-                
-        elif order.order_type in [OrderType.STOP_LOSS, OrderType.TAKE_PROFIT]:
-            # OKX conditional orders
-            params["ordType"] = "conditional"
-            params["triggerPx"] = str(self.round_price(order.symbol, order.stop_price))
-            params["triggerPxType"] = "last"  # or "index", "mark"
-            
-            if order.price:
-                params["px"] = str(self.round_price(order.symbol, order.price))
-                
-        # Reduce only
-        if order.reduce_only:
-            params["reduceOnly"] = True
-            
-        # Place order
-        try:
-            response = await self._make_request(
-                "POST",
-                "/api/v5/trade/order",
-                params=params,
-                signed=True
-            )
-            
-            order_data = response.get("data", [{}])[0]
-            
-            # Apply post-order behavior
-            await self.profile.post_order_behavior(order, order_data)
-            
-            return {
-                "order_id": order.order_id,
-                "exchange_order_id": order_data.get("ordId"),
-                "status": "OPEN" if order_data.get("sCode") == "0" else "REJECTED",
-                "created_at": datetime.now(timezone.utc)
-            }
+            logger.info(f"Loaded {len(self.instruments)} instruments from OKX")
             
         except Exception as e:
-            logger.error(f"Failed to place order on OKX: {e}")
-            raise OrderExecutionError(str(e), order.order_id, self.name)
+            logger.error(f"Failed to load instruments: {str(e)}")
+            raise
+    
+    async def _check_account_config(self):
+        """Check account configuration"""
+        try:
+            # Get account configuration
+            response = await self._get("/api/v5/account/config", signed=True)
             
-    async def cancel_order(self, order_id: str, symbol: str) -> Dict[str, Any]:
-        """Cancel existing order"""
-        params = {
-            "instId": symbol,
-            "clOrdId": order_id[:32]
-        }
+            if response['code'] == '0' and response['data']:
+                config_data = response['data'][0]
+                self.account_level = config_data.get('acctLv', 'Simple')
+                self.position_mode = config_data.get('posMode', 'net_mode')
+                
+                logger.info(f"OKX account level: {self.account_level}, position mode: {self.position_mode}")
+                
+        except Exception as e:
+            logger.error(f"Failed to check account config: {str(e)}")
+    
+    async def _check_connection(self):
+        """Check OKX connection"""
+        # Get server time
+        response = await self._get("/api/v5/public/time")
         
-        response = await self._make_request(
-            "POST",
-            "/api/v5/trade/cancel-order",
-            params=params,
-            signed=True
-        )
-        
-        return {
-            "order_id": order_id,
-            "status": "CANCELLED",
-            "cancelled_at": datetime.now(timezone.utc)
-        }
-        
-    async def get_order_status(self, order_id: str, symbol: str) -> Dict[str, Any]:
-        """Get order status"""
-        params = {
-            "instId": symbol,
-            "clOrdId": order_id[:32]
-        }
-        
-        response = await self._make_request(
-            "GET",
-            "/api/v5/trade/order",
-            params=params,
-            signed=True
-        )
-        
-        order_data = response.get("data", [{}])[0] if response.get("data") else {}
-        
-        if order_data:
-            return {
-                "order_id": order_id,
-                "exchange_order_id": order_data.get("ordId"),
-                "status": normalize_order_status(order_data.get("state")),
-                "filled_quantity": Decimal(order_data.get("fillSz", "0")),
-                "average_price": Decimal(order_data.get("avgPx", "0")) if order_data.get("avgPx") else None
-            }
+        if response['code'] == '0':
+            server_time = int(response['data'][0]['ts'])
+            local_time = int(time.time() * 1000)
             
-        return {
-            "order_id": order_id,
-            "status": "UNKNOWN"
-        }
+            time_diff = abs(server_time - local_time)
+            if time_diff > 5000:  # 5 seconds
+                logger.warning(f"Time sync issue: server time differs by {time_diff}ms")
+    
+    async def _get_auth_headers(
+        self,
+        method: str,
+        endpoint: str,
+        params: Optional[Dict],
+        data: Optional[Dict]
+    ) -> Dict[str, str]:
+        """Generate OKX authentication headers"""
+        headers = await self.authenticator.get_auth_headers(method, endpoint, params, data)
         
-    async def get_open_orders(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Get all open orders"""
-        params = {}
-        if symbol:
-            params["instId"] = symbol
-            
-        response = await self._make_request(
-            "GET",
-            "/api/v5/trade/orders-pending",
-            params=params,
-            signed=True
-        )
+        # Add testnet flag if needed
+        if self.config.testnet:
+            headers['x-simulated-trading'] = '1'
         
-        orders = []
-        for order_data in response.get("data", []):
-            orders.append({
-                "order_id": order_data.get("clOrdId", order_data.get("ordId")),
-                "exchange_order_id": order_data.get("ordId"),
-                "symbol": order_data.get("instId"),
-                "side": "BUY" if order_data.get("side") == "buy" else "SELL",
-                "type": order_data.get("ordType"),
-                "status": normalize_order_status(order_data.get("state")),
-                "quantity": Decimal(order_data.get("sz", "0")),
-                "filled_quantity": Decimal(order_data.get("fillSz", "0")),
-                "price": Decimal(order_data.get("px", "0")),
-                "created_at": datetime.fromtimestamp(int(order_data.get("cTime", 0)) / 1000, tz=timezone.utc)
-            })
-            
-        return orders
-        
-    async def create_grid_bot(
+        return headers
+    
+    # Trading methods
+    async def place_order(
         self,
         symbol: str,
-        lower_price: Decimal,
-        upper_price: Decimal,
-        grid_count: int,
-        investment: Decimal
-    ) -> Dict[str, Any]:
-        """Create grid trading bot"""
-        params = {
-            "instId": symbol,
-            "algoOrdType": "grid",
-            "maxPx": str(upper_price),
-            "minPx": str(lower_price),
-            "gridNum": str(grid_count),
-            "runType": "1",  # Start immediately
-            "sz": str(investment),
-            "tdMode": "cash",
-            "quoteSz": str(investment)
-        }
-        
-        response = await self._make_request(
-            "POST",
-            "/api/v5/tradingBot/grid/order-algo",
-            params=params,
-            signed=True
+        side: str,
+        order_type: OrderType,
+        size: float,
+        price: Optional[float] = None,
+        params: Optional[Dict] = None
+    ) -> Order:
+        """Place an order on OKX"""
+        return await self.unified_trading.place_order(
+            symbol, side, order_type, size, price, params
         )
-        
-        algo_data = response.get("data", [{}])[0]
-        
-        return {
-            "algo_id": algo_data.get("algoId"),
-            "status": "active",
-            "created_at": datetime.now(timezone.utc)
-        }
-        
-    async def stop_grid_bot(self, algo_id: str) -> Dict[str, Any]:
-        """Stop grid trading bot"""
-        params = {
-            "algoId": algo_id
-        }
-        
-        response = await self._make_request(
-            "POST",
-            "/api/v5/tradingBot/grid/stop-order-algo",
-            params=params,
-            signed=True
+    
+    async def cancel_order(self, order_id: str, symbol: Optional[str] = None) -> bool:
+        """Cancel an order"""
+        return await self.unified_trading.cancel_order(order_id, symbol)
+    
+    async def get_order(self, order_id: str, symbol: Optional[str] = None) -> Optional[Order]:
+        """Get order details"""
+        return await self.unified_trading.get_order(order_id, symbol)
+    
+    async def get_open_orders(self, symbol: Optional[str] = None) -> List[Order]:
+        """Get open orders"""
+        return await self.unified_trading.get_open_orders(symbol)
+    
+    async def get_order_history(
+        self,
+        symbol: Optional[str] = None,
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
+        limit: int = 100
+    ) -> List[Order]:
+        """Get order history"""
+        return await self.unified_trading.get_order_history(
+            symbol, start_time, end_time, limit
         )
-        
-        return {
-            "algo_id": algo_id,
-            "status": "stopped",
-            "stopped_at": datetime.now(timezone.utc)
-        }
-        
-    async def subscribe_ticker(self, symbol: str) -> AsyncGenerator[Ticker, None]:
-        """Subscribe to ticker updates via WebSocket"""
-        subscribe_msg = {
-            "op": "subscribe",
-            "args": [{
-                "channel": "tickers",
-                "instId": symbol
-            }]
-        }
-        
-        await self.public_ws.send(subscribe_msg)
-        
-        async for message in self.public_ws.receive():
-            if message.get("arg", {}).get("channel") == "tickers":
-                for ticker_data in message.get("data", []):
-                    if ticker_data.get("instId") == symbol:
-                        yield Ticker(
-                            timestamp=datetime.fromtimestamp(int(ticker_data.get("ts", 0)) / 1000, tz=timezone.utc),
-                            symbol=symbol,
-                            bid=Decimal(ticker_data.get("bidPx", "0")),
-                            ask=Decimal(ticker_data.get("askPx", "0")),
-                            last=Decimal(ticker_data.get("last", "0")),
-                            volume_24h=Decimal(ticker_data.get("vol24h", "0")),
-                            high_24h=Decimal(ticker_data.get("high24h", "0")),
-                            low_24h=Decimal(ticker_data.get("low24h", "0")),
-                            change_24h=Decimal(ticker_data.get("sodUtc8", "0"))
-                        )
-                        
-    async def subscribe_order_book(self, symbol: str) -> AsyncGenerator[OrderBook, None]:
-        """Subscribe to order book updates via WebSocket"""
-        # Create order book manager
-        if symbol not in self.order_books:
-            self.order_books[symbol] = OrderBookManager(symbol)
+    
+    # Market data methods
+    async def get_ticker(self, symbol: str) -> Ticker:
+        """Get ticker for symbol"""
+        try:
+            response = await self._get(
+                "/api/v5/market/ticker",
+                params={'instId': symbol}
+            )
             
-        manager = self.order_books[symbol]
-        
-        # Subscribe to order book
-        subscribe_msg = {
-            "op": "subscribe",
-            "args": [{
-                "channel": "books5",  # Top 5 levels
-                "instId": symbol
-            }]
+            if response['code'] != '0':
+                raise Exception(f"Failed to get ticker: {response['msg']}")
+            
+            ticker_data = response['data'][0]
+            
+            return Ticker(
+                symbol=symbol,
+                bid=float(ticker_data['bidPx']) if ticker_data['bidPx'] else 0,
+                ask=float(ticker_data['askPx']) if ticker_data['askPx'] else 0,
+                bid_size=float(ticker_data['bidSz']) if ticker_data['bidSz'] else 0,
+                ask_size=float(ticker_data['askSz']) if ticker_data['askSz'] else 0,
+                last=float(ticker_data['last']),
+                volume_24h=float(ticker_data['vol24h']) if ticker_data['vol24h'] else 0,
+                quote_volume_24h=float(ticker_data['volCcy24h']) if ticker_data['volCcy24h'] else 0,
+                open_24h=float(ticker_data['open24h']) if ticker_data['open24h'] else 0,
+                high_24h=float(ticker_data['high24h']) if ticker_data['high24h'] else 0,
+                low_24h=float(ticker_data['low24h']) if ticker_data['low24h'] else 0,
+                change_24h=float(ticker_data['last']) - float(ticker_data['open24h']) if ticker_data['open24h'] else 0,
+                change_percent_24h=(float(ticker_data['last']) / float(ticker_data['open24h']) - 1) * 100 if ticker_data['open24h'] and float(ticker_data['open24h']) > 0 else 0,
+                timestamp=datetime.fromtimestamp(int(ticker_data['ts']) / 1000, tz=timezone.utc)
+            )
+            
+        except Exception as e:
+            logger.error(f"Error getting ticker: {str(e)}")
+            raise
+    
+    async def get_orderbook(self, symbol: str, depth: int = 50) -> OrderBook:
+        """Get order book"""
+        try:
+            response = await self._get(
+                "/api/v5/market/books",
+                params={'instId': symbol, 'sz': str(depth)}
+            )
+            
+            if response['code'] != '0':
+                raise Exception(f"Failed to get orderbook: {response['msg']}")
+            
+            book_data = response['data'][0]
+            
+            return OrderBook(
+                symbol=symbol,
+                bids=[[float(p), float(s), int(c), int(o)] for p, s, c, o in book_data['bids']],
+                asks=[[float(p), float(s), int(c), int(o)] for p, s, c, o in book_data['asks']],
+                timestamp=datetime.fromtimestamp(int(book_data['ts']) / 1000, tz=timezone.utc)
+            )
+            
+        except Exception as e:
+            logger.error(f"Error getting orderbook: {str(e)}")
+            raise
+    
+    async def get_trades(self, symbol: str, limit: int = 100) -> List[Trade]:
+        """Get recent trades"""
+        try:
+            response = await self._get(
+                "/api/v5/market/trades",
+                params={'instId': symbol, 'limit': str(limit)}
+            )
+            
+            if response['code'] != '0':
+                raise Exception(f"Failed to get trades: {response['msg']}")
+            
+            trades = []
+            for trade_data in response['data']:
+                trades.append(Trade(
+                    id=trade_data['tradeId'],
+                    order_id=None,
+                    symbol=symbol,
+                    side=OrderSide.BUY if trade_data['side'] == 'buy' else OrderSide.SELL,
+                    price=float(trade_data['px']),
+                    size=float(trade_data['sz']),
+                    fee=0,
+                    fee_currency=None,
+                    timestamp=datetime.fromtimestamp(int(trade_data['ts']) / 1000, tz=timezone.utc),
+                    is_maker=False
+                ))
+            
+            return trades
+            
+        except Exception as e:
+            logger.error(f"Error getting trades: {str(e)}")
+            raise
+    
+    async def get_candles(
+        self,
+        symbol: str,
+        timeframe: str,
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
+        limit: int = 100
+    ) -> List[Candle]:
+        """Get historical candles"""
+        try:
+            params = {
+                'instId': symbol,
+                'bar': self._convert_timeframe(timeframe),
+                'limit': str(limit)
+            }
+            
+            if end_time:
+                params['after'] = str(int(end_time.timestamp() * 1000))
+            if start_time:
+                params['before'] = str(int(start_time.timestamp() * 1000))
+            
+            response = await self._get("/api/v5/market/candles", params=params)
+            
+            if response['code'] != '0':
+                raise Exception(f"Failed to get candles: {response['msg']}")
+            
+            candles = []
+            for candle_data in response['data']:
+                candles.append(Candle(
+                    timestamp=datetime.fromtimestamp(int(candle_data[0]) / 1000, tz=timezone.utc),
+                    open=float(candle_data[1]),
+                    high=float(candle_data[2]),
+                    low=float(candle_data[3]),
+                    close=float(candle_data[4]),
+                    volume=float(candle_data[5]),
+                    trades=0  # Not provided
+                ))
+            
+            return sorted(candles, key=lambda x: x.timestamp)
+            
+        except Exception as e:
+            logger.error(f"Error getting candles: {str(e)}")
+            raise
+    
+    # Account methods
+    async def get_balance(self) -> Dict[str, Balance]:
+        """Get account balance"""
+        return await self.unified_trading.get_balance()
+    
+    async def get_open_positions(self) -> List[Position]:
+        """Get open positions"""
+        return await self.unified_trading.get_open_positions()
+    
+    async def get_position(self, symbol: str) -> Optional[Position]:
+        """Get specific position"""
+        return await self.unified_trading.get_position(symbol)
+    
+    # WebSocket methods
+    async def _connect_websocket(self):
+        """Connect to OKX WebSocket"""
+        await self.ws_client.connect(
+            on_message=self.ws_on_message,
+            on_error=self.ws_on_error,
+            on_close=self.ws_on_close
+        )
+    
+    async def subscribe_ticker(self, symbol: str):
+        """Subscribe to ticker updates"""
+        await self.ws_client.subscribe_ticker(symbol)
+    
+    async def subscribe_orderbook(self, symbol: str, depth: str = "books5"):
+        """Subscribe to order book updates"""
+        await self.ws_client.subscribe_orderbook(symbol, depth)
+    
+    async def subscribe_trades(self, symbol: str):
+        """Subscribe to trade updates"""
+        await self.ws_client.subscribe_trades(symbol)
+    
+    async def subscribe_user_orders(self):
+        """Subscribe to user order updates"""
+        await self.ws_client.subscribe_user_data()
+    
+    async def subscribe_user_positions(self):
+        """Subscribe to user position updates"""
+        await self.ws_client.subscribe_user_data()
+    
+    # OKX specific methods
+    async def get_funding_rate(self, symbol: str) -> Dict[str, Any]:
+        """Get funding rate for perpetual swaps"""
+        try:
+            response = await self._get(
+                "/api/v5/public/funding-rate",
+                params={'instId': symbol}
+            )
+            
+            if response['code'] == '0' and response['data']:
+                data = response['data'][0]
+                return {
+                    'symbol': data['instId'],
+                    'fundingRate': float(data['fundingRate']),
+                    'fundingTime': datetime.fromtimestamp(int(data['fundingTime']) / 1000, tz=timezone.utc),
+                    'nextFundingRate': float(data['nextFundingRate']) if data.get('nextFundingRate') else None,
+                    'nextFundingTime': datetime.fromtimestamp(int(data['nextFundingTime']) / 1000, tz=timezone.utc) if data.get('nextFundingTime') else None
+                }
+            
+            return {}
+            
+        except Exception as e:
+            logger.error(f"Error getting funding rate: {str(e)}")
+            return {}
+    
+    async def get_mark_price(self, symbol: str) -> float:
+        """Get mark price"""
+        try:
+            inst_type = self.instruments.get(symbol, {}).get('instType', 'SWAP')
+            
+            response = await self._get(
+                "/api/v5/public/mark-price",
+                params={'instId': symbol, 'instType': inst_type}
+            )
+            
+            if response['code'] == '0' and response['data']:
+                return float(response['data'][0]['markPx'])
+            
+            return 0.0
+            
+        except Exception as e:
+            logger.error(f"Error getting mark price: {str(e)}")
+            return 0.0
+    
+    async def set_leverage(self, symbol: str, leverage: int, margin_mode: str = "cross") -> bool:
+        """Set leverage for a symbol"""
+        return await self.unified_trading.set_leverage(symbol, leverage, margin_mode)
+    
+    async def get_max_order_size(self, symbol: str, price: Optional[float] = None) -> Dict[str, float]:
+        """Get maximum order size"""
+        return await self.unified_trading.get_max_order_size(symbol, price)
+    
+    # Helper methods
+    def _convert_timeframe(self, timeframe: str) -> str:
+        """Convert standard timeframe to OKX format"""
+        timeframe_map = {
+            '1m': '1m',
+            '3m': '3m',
+            '5m': '5m',
+            '15m': '15m',
+            '30m': '30m',
+            '1h': '1H',
+            '2h': '2H',
+            '4h': '4H',
+            '6h': '6H',
+            '12h': '12H',
+            '1d': '1D',
+            '2d': '2D',
+            '3d': '3D',
+            '1w': '1W',
+            '1M': '1M',
+            '3M': '3M'
         }
+        return timeframe_map.get(timeframe, '1H')
+    
+    def _get_inst_type(self, symbol: str) -> str:
+        """Get instrument type for symbol"""
+        if symbol in self.instruments:
+            return self.instruments[symbol]['instType']
         
-        await self.public_ws.send(subscribe_msg)
-        
-        async for message in self.public_ws.receive():
-            if message.get("arg", {}).get("channel") == "books5":
-                data = message.get("data", [{}])[0]
-                
-                if data.get("instId") == symbol:
-                    bids = [(Decimal(b[0]), Decimal(b[1])) for b in data.get("bids", [])]
-                    asks = [(Decimal(a[0]), Decimal(a[1])) for a in data.get("asks", [])]
-                    
-                    yield OrderBook(
-                        timestamp=datetime.fromtimestamp(int(data.get("ts", 0)) / 1000, tz=timezone.utc),
-                        symbol=symbol,
-                        bids=bids,
-                        asks=asks
-                    )
-                    
-    async def subscribe_trades(self, symbol: str) -> AsyncGenerator[Dict[str, Any], None]:
-        """Subscribe to trade updates via WebSocket"""
-        subscribe_msg = {
-            "op": "subscribe",
-            "args": [{
-                "channel": "trades",
-                "instId": symbol
-            }]
-        }
-        
-        await self.public_ws.send(subscribe_msg)
-        
-        async for message in self.public_ws.receive():
-            if message.get("arg", {}).get("channel") == "trades":
-                for trade in message.get("data", []):
-                    if trade.get("instId") == symbol:
-                        yield {
-                            "trade_id": trade.get("tradeId"),
-                            "timestamp": datetime.fromtimestamp(int(trade.get("ts", 0)) / 1000, tz=timezone.utc),
-                            "symbol": symbol,
-                            "price": Decimal(trade.get("px", "0")),
-                            "quantity": Decimal(trade.get("sz", "0")),
-                            "side": trade.get("side"),
-                            "is_buyer_maker": trade.get("side") == "buy"
-                        }
+        # Guess based on symbol pattern
+        if '-SWAP' in symbol:
+            return 'SWAP'
+        elif '-' in symbol and symbol.count('-') >= 2:
+            # Could be futures or options
+            parts = symbol.split('-')
+            if parts[-1].startswith('C') or parts[-1].startswith('P'):
+                return 'OPTION'
+            else:
+                return 'FUTURES'
+        else:
+            return 'SPOT'

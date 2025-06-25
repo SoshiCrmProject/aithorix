@@ -1,590 +1,635 @@
 """
-AITHORIX Base Exchange Classes
-Abstract base classes for all exchange implementations
+AITHORIX Base Exchange Class
+Abstract base class for all exchange implementations
 """
 
-import asyncio
-import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from decimal import Decimal
-from typing import Dict, List, Optional, Any, Tuple, AsyncGenerator
+from datetime import datetime
 from enum import Enum
-import hashlib
+from typing import Dict, List, Optional, Any, Callable, Tuple
+import asyncio
+import logging
+import time
 import hmac
+import hashlib
 import json
-
 import aiohttp
-import websockets
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-import structlog
+from decimal import Decimal
 
-from ..core.exceptions import (
-    ExchangeConnectionError,
-    OrderExecutionError,
-    RateLimitError,
-    AuthenticationError
-)
-from ..core.engine.trading_engine import Order, OrderType, OrderSide, OrderStatus
-from ..stealth.antidetection.api_normalizer import APIRateLimiter
-from ..stealth.antidetection.timing_jitter import TimingJitter
+logger = logging.getLogger(__name__)
 
 
-logger = structlog.get_logger()
+class OrderType(Enum):
+    """Order types"""
+    MARKET = "market"
+    LIMIT = "limit"
+    STOP = "stop"
+    STOP_LIMIT = "stop_limit"
+    TRAILING_STOP = "trailing_stop"
+    POST_ONLY = "post_only"
+    FOK = "fok"  # Fill or Kill
+    IOC = "ioc"  # Immediate or Cancel
+
+
+class OrderSide(Enum):
+    """Order side"""
+    BUY = "buy"
+    SELL = "sell"
+
+
+class OrderStatus(Enum):
+    """Order status"""
+    PENDING = "pending"
+    OPEN = "open"
+    PARTIALLY_FILLED = "partially_filled"
+    FILLED = "filled"
+    CANCELLED = "cancelled"
+    REJECTED = "rejected"
+    EXPIRED = "expired"
+
+
+class TimeInForce(Enum):
+    """Time in force"""
+    GTC = "gtc"  # Good Till Cancelled
+    IOC = "ioc"  # Immediate or Cancel
+    FOK = "fok"  # Fill or Kill
+    GTX = "gtx"  # Good Till Crossing
+    DAY = "day"  # Day order
+
+
+class PositionSide(Enum):
+    """Position side for futures"""
+    LONG = "long"
+    SHORT = "short"
+    BOTH = "both"  # For one-way mode
 
 
 @dataclass
-class ExchangeCredentials:
-    """Exchange API credentials"""
+class ExchangeConfig:
+    """Exchange configuration"""
     api_key: str
     api_secret: str
-    passphrase: Optional[str] = None  # For OKX
+    passphrase: Optional[str] = None  # For exchanges that require it
     testnet: bool = False
     
-
-@dataclass
-class MarketInfo:
-    """Market trading rules and information"""
-    symbol: str
-    base_asset: str
-    quote_asset: str
-    min_quantity: Decimal
-    max_quantity: Decimal
-    quantity_precision: int
-    min_price: Decimal
-    max_price: Decimal
-    price_precision: int
-    min_notional: Decimal
-    is_trading: bool
-    maker_fee: Decimal
-    taker_fee: Decimal
+    # API endpoints
+    rest_url: str = ""
+    ws_url: str = ""
     
+    # Rate limits
+    rate_limit_per_second: int = 10
+    rate_limit_per_minute: int = 1200
+    
+    # Trading fees
+    maker_fee: float = 0.001
+    taker_fee: float = 0.001
+    
+    # Connection settings
+    timeout: int = 30
+    max_retries: int = 3
+    retry_delay: float = 1.0
+    
+    # Features
+    supports_futures: bool = True
+    supports_options: bool = False
+    supports_margin: bool = True
+    supports_websocket: bool = True
+    
+    # Risk limits
+    max_position_size: float = 100000
+    max_leverage: int = 20
+    
+    # Custom settings per exchange
+    custom_settings: Dict[str, Any] = field(default_factory=dict)
+
 
 @dataclass
-class OrderBook:
-    """Order book snapshot"""
+class Order:
+    """Order data structure"""
+    order_id: str
+    client_order_id: Optional[str]
+    symbol: str
+    side: OrderSide
+    order_type: OrderType
+    status: OrderStatus
+    price: Optional[float]
+    size: float
+    filled_size: float
+    average_price: Optional[float]
+    fee: float
+    fee_currency: str
+    time_in_force: TimeInForce
+    created_at: datetime
+    updated_at: datetime
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class Trade:
+    """Trade data structure"""
+    trade_id: str
+    order_id: str
+    symbol: str
+    side: OrderSide
+    price: float
+    size: float
+    fee: float
+    fee_currency: str
     timestamp: datetime
-    symbol: str
-    bids: List[Tuple[Decimal, Decimal]]  # (price, quantity)
-    asks: List[Tuple[Decimal, Decimal]]  # (price, quantity)
-    
+    is_maker: bool
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
 
 @dataclass
-class Ticker:
-    """Market ticker data"""
-    timestamp: datetime
+class Position:
+    """Position data structure"""
     symbol: str
-    bid: Decimal
-    ask: Decimal
-    last: Decimal
-    volume_24h: Decimal
-    high_24h: Decimal
-    low_24h: Decimal
-    change_24h: Decimal
-    
+    side: PositionSide
+    size: float
+    entry_price: float
+    mark_price: float
+    liquidation_price: Optional[float]
+    unrealized_pnl: float
+    realized_pnl: float
+    margin: float
+    leverage: int
+    created_at: datetime
+    updated_at: datetime
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
 
 @dataclass
 class Balance:
-    """Account balance"""
-    asset: str
-    free: Decimal
-    locked: Decimal
-    total: Decimal
-    
+    """Balance data structure"""
+    currency: str
+    free: float
+    used: float
+    total: float
+    usd_value: Optional[float] = None
+    updated_at: datetime = field(default_factory=datetime.now)
+
+
+@dataclass
+class Ticker:
+    """Ticker data structure"""
+    symbol: str
+    bid: float
+    ask: float
+    last: float
+    volume_24h: float
+    quote_volume_24h: float
+    high_24h: float
+    low_24h: float
+    change_24h: float
+    change_percent_24h: float
+    timestamp: datetime
+
+
+@dataclass
+class OrderBook:
+    """Order book data structure"""
+    symbol: str
+    bids: List[Tuple[float, float]]  # [(price, size), ...]
+    asks: List[Tuple[float, float]]  # [(price, size), ...]
+    timestamp: datetime
+    sequence: Optional[int] = None
+
+
+@dataclass
+class Candle:
+    """Candlestick data structure"""
+    symbol: str
+    timeframe: str
+    open_time: datetime
+    close_time: datetime
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
+    quote_volume: float
+    trades: int
+
 
 class BaseExchange(ABC):
     """
     Abstract base class for all exchange implementations
-    Provides common functionality and enforces interface
     """
     
-    def __init__(
-        self, 
-        credentials: ExchangeCredentials,
-        rate_limiter: Optional[APIRateLimiter] = None,
-        timing_jitter: Optional[TimingJitter] = None
-    ):
-        self.credentials = credentials
-        self.rate_limiter = rate_limiter or APIRateLimiter()
-        self.timing_jitter = timing_jitter or TimingJitter()
-        
-        # Exchange specific attributes (override in subclasses)
-        self.name: str = "base"
-        self.base_url: str = ""
-        self.ws_url: str = ""
-        self.rate_limits: Dict[str, int] = {}
-        
-        # Connection management
+    def __init__(self, config: ExchangeConfig):
+        self.config = config
         self.session: Optional[aiohttp.ClientSession] = None
-        self.ws_connections: Dict[str, websockets.WebSocketClientProtocol] = {}
+        self.ws_session: Optional[aiohttp.ClientSession] = None
+        self.ws_connection = None
         
-        # Market information cache
-        self.markets: Dict[str, MarketInfo] = {}
-        self.last_market_update: float = 0
-        self.market_update_interval: int = 3600  # 1 hour
+        # Rate limiting
+        self.last_request_time = 0
+        self.request_count = 0
+        self.minute_request_count = 0
+        self.minute_start_time = time.time()
         
-        # Performance tracking
-        self.request_count: int = 0
-        self.error_count: int = 0
-        self.last_request_time: float = 0
+        # Callbacks
+        self.error_callback: Optional[Callable] = None
+        self.order_callback: Optional[Callable] = None
         
-    async def __aenter__(self):
-        """Async context manager entry"""
-        await self.connect()
-        return self
+        # Cache
+        self.symbol_info_cache: Dict[str, Any] = {}
+        self.balance_cache: Dict[str, Balance] = {}
+        self.position_cache: Dict[str, Position] = {}
         
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """Async context manager exit"""
-        await self.disconnect()
+        # State
+        self.is_initialized = False
+        self.is_connected = False
         
-    async def connect(self) -> None:
+        logger.info(f"Initialized {self.__class__.__name__} base exchange")
+    
+    async def initialize(self):
         """Initialize exchange connection"""
-        if not self.session:
-            timeout = aiohttp.ClientTimeout(total=30)
-            connector = aiohttp.TCPConnector(limit=100, limit_per_host=30)
-            
-            self.session = aiohttp.ClientSession(
-                timeout=timeout,
-                connector=connector,
-                headers=self._get_default_headers()
-            )
-            
-        # Load market information
-        await self._update_markets()
-        
-        logger.info(f"Connected to {self.name} exchange")
-        
-    async def disconnect(self) -> None:
-        """Close exchange connections"""
-        # Close WebSocket connections
-        for ws in self.ws_connections.values():
-            await ws.close()
-        self.ws_connections.clear()
-        
-        # Close HTTP session
-        if self.session:
-            await self.session.close()
-            self.session = None
-            
-        logger.info(f"Disconnected from {self.name} exchange")
-        
-    def _get_default_headers(self) -> Dict[str, str]:
-        """Get default HTTP headers with stealth modifications"""
-        return {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "application/json",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "gzip, deflate, br",
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-        }
-        
-    @abstractmethod
-    def _sign_request(self, method: str, path: str, params: Dict[str, Any]) -> Dict[str, str]:
-        """Sign request for authentication - implement in subclasses"""
-        pass
-        
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=1, max=10),
-        retry=retry_if_exception_type((aiohttp.ClientError, asyncio.TimeoutError))
-    )
-    async def _make_request(
-        self, 
-        method: str, 
-        endpoint: str, 
-        params: Optional[Dict[str, Any]] = None,
-        signed: bool = False
-    ) -> Dict[str, Any]:
-        """Make HTTP request with retry logic and rate limiting"""
-        
-        # Apply rate limiting
-        await self.rate_limiter.acquire(self.name, endpoint)
-        
-        # Apply timing jitter for stealth
-        await self.timing_jitter.add_delay()
-        
-        url = f"{self.base_url}{endpoint}"
-        
-        # Sign request if needed
-        headers = self._get_default_headers()
-        if signed:
-            headers.update(self._sign_request(method, endpoint, params or {}))
-            
-        # Track request timing
-        start_time = time.time()
-        self.request_count += 1
-        
-        try:
-            if method == "GET":
-                async with self.session.get(url, params=params, headers=headers) as response:
-                    return await self._handle_response(response)
-            elif method == "POST":
-                async with self.session.post(url, json=params, headers=headers) as response:
-                    return await self._handle_response(response)
-            elif method == "PUT":
-                async with self.session.put(url, json=params, headers=headers) as response:
-                    return await self._handle_response(response)
-            elif method == "DELETE":
-                async with self.session.delete(url, params=params, headers=headers) as response:
-                    return await self._handle_response(response)
-            else:
-                raise ValueError(f"Unsupported HTTP method: {method}")
-                
-        except Exception as e:
-            self.error_count += 1
-            logger.error(f"Request failed to {self.name}: {e}")
-            raise ExchangeConnectionError(self.name, str(e))
-        finally:
-            self.last_request_time = time.time() - start_time
-            
-    async def _handle_response(self, response: aiohttp.ClientResponse) -> Dict[str, Any]:
-        """Handle API response with error checking"""
-        text = await response.text()
-        
-        # Check for rate limit
-        if response.status == 429:
-            retry_after = int(response.headers.get("Retry-After", 60))
-            raise RateLimitError(
-                limit=self.rate_limits.get("default", 1000),
-                window="minute",
-                retry_after=retry_after
-            )
-            
-        # Check for auth errors
-        if response.status in [401, 403]:
-            raise AuthenticationError(f"Authentication failed on {self.name}")
-            
-        # Check for other errors
-        if response.status >= 400:
-            try:
-                error_data = json.loads(text)
-                error_msg = error_data.get("msg", error_data.get("message", text))
-            except:
-                error_msg = text
-            raise ExchangeConnectionError(self.name, f"HTTP {response.status}: {error_msg}")
-            
-        # Parse JSON response
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            raise ExchangeConnectionError(self.name, f"Invalid JSON response: {text}")
-            
-    async def _update_markets(self) -> None:
-        """Update market information cache"""
-        current_time = time.time()
-        
-        # Check if update needed
-        if current_time - self.last_market_update < self.market_update_interval:
+        if self.is_initialized:
             return
-            
-        try:
-            markets_data = await self.get_markets()
-            
-            self.markets.clear()
-            for market in markets_data:
-                self.markets[market.symbol] = market
-                
-            self.last_market_update = current_time
-            logger.info(f"Updated {len(self.markets)} markets for {self.name}")
-            
-        except Exception as e:
-            logger.error(f"Failed to update markets for {self.name}: {e}")
-            
-    def get_market_info(self, symbol: str) -> Optional[MarketInfo]:
-        """Get market information for symbol"""
-        return self.markets.get(symbol)
         
-    def round_quantity(self, symbol: str, quantity: Decimal) -> Decimal:
-        """Round quantity to exchange precision"""
-        market = self.get_market_info(symbol)
-        if not market:
-            return quantity
-            
-        precision = market.quantity_precision
-        return Decimal(str(round(float(quantity), precision)))
-        
-    def round_price(self, symbol: str, price: Decimal) -> Decimal:
-        """Round price to exchange precision"""
-        market = self.get_market_info(symbol)
-        if not market:
-            return price
-            
-        precision = market.price_precision
-        return Decimal(str(round(float(price), precision)))
-        
-    def validate_order(self, order: Order) -> Tuple[bool, Optional[str]]:
-        """Validate order against exchange rules"""
-        market = self.get_market_info(order.symbol)
-        if not market:
-            return False, f"Unknown market: {order.symbol}"
-            
-        # Check if market is trading
-        if not market.is_trading:
-            return False, f"Market {order.symbol} is not trading"
-            
-        # Check quantity limits
-        if order.quantity < market.min_quantity:
-            return False, f"Quantity {order.quantity} below minimum {market.min_quantity}"
-            
-        if order.quantity > market.max_quantity:
-            return False, f"Quantity {order.quantity} above maximum {market.max_quantity}"
-            
-        # Check price limits for limit orders
-        if order.order_type == OrderType.LIMIT and order.price:
-            if order.price < market.min_price:
-                return False, f"Price {order.price} below minimum {market.min_price}"
-                
-            if order.price > market.max_price:
-                return False, f"Price {order.price} above maximum {market.max_price}"
-                
-        # Check minimum notional
-        notional = order.quantity * (order.price or market.last)
-        if notional < market.min_notional:
-            return False, f"Notional {notional} below minimum {market.min_notional}"
-            
-        return True, None
-        
-    # Abstract methods to be implemented by subclasses
-    @abstractmethod
-    async def get_markets(self) -> List[MarketInfo]:
-        """Get all available markets"""
-        pass
-        
-    @abstractmethod
-    async def get_ticker(self, symbol: str) -> Ticker:
-        """Get current ticker for symbol"""
-        pass
-        
-    @abstractmethod
-    async def get_order_book(self, symbol: str, limit: int = 100) -> OrderBook:
-        """Get order book for symbol"""
-        pass
-        
-    @abstractmethod
-    async def get_balance(self) -> List[Balance]:
-        """Get account balances"""
-        pass
-        
-    @abstractmethod
-    async def place_order(self, order: Order) -> Dict[str, Any]:
-        """Place new order"""
-        pass
-        
-    @abstractmethod
-    async def cancel_order(self, order_id: str, symbol: str) -> Dict[str, Any]:
-        """Cancel existing order"""
-        pass
-        
-    @abstractmethod
-    async def get_order_status(self, order_id: str, symbol: str) -> Dict[str, Any]:
-        """Get order status"""
-        pass
-        
-    @abstractmethod
-    async def get_open_orders(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Get all open orders"""
-        pass
-        
-    @abstractmethod
-    async def subscribe_ticker(self, symbol: str) -> AsyncGenerator[Ticker, None]:
-        """Subscribe to ticker updates via WebSocket"""
-        pass
-        
-    @abstractmethod
-    async def subscribe_order_book(self, symbol: str) -> AsyncGenerator[OrderBook, None]:
-        """Subscribe to order book updates via WebSocket"""
-        pass
-        
-    @abstractmethod
-    async def subscribe_trades(self, symbol: str) -> AsyncGenerator[Dict[str, Any], None]:
-        """Subscribe to trade updates via WebSocket"""
-        pass
-
-
-class WebSocketManager:
-    """
-    WebSocket connection manager with automatic reconnection
-    """
-    
-    def __init__(self, url: str, headers: Optional[Dict[str, str]] = None):
-        self.url = url
-        self.headers = headers or {}
-        self.ws: Optional[websockets.WebSocketClientProtocol] = None
-        self.is_connected = False
-        self.reconnect_delay = 5
-        self.max_reconnect_delay = 60
-        self._stop = False
-        
-    async def connect(self) -> None:
-        """Establish WebSocket connection"""
-        try:
-            self.ws = await websockets.connect(
-                self.url,
-                extra_headers=self.headers,
-                ping_interval=20,
-                ping_timeout=10
-            )
-            self.is_connected = True
-            self.reconnect_delay = 5  # Reset delay on successful connection
-            logger.info(f"WebSocket connected to {self.url}")
-            
-        except Exception as e:
-            logger.error(f"WebSocket connection failed: {e}")
-            raise
-            
-    async def disconnect(self) -> None:
-        """Close WebSocket connection"""
-        self._stop = True
-        if self.ws:
-            await self.ws.close()
-            self.ws = None
-        self.is_connected = False
-        logger.info(f"WebSocket disconnected from {self.url}")
-        
-    async def send(self, message: Dict[str, Any]) -> None:
-        """Send message to WebSocket"""
-        if not self.is_connected or not self.ws:
-            raise ExchangeConnectionError("websocket", "WebSocket not connected")
-            
-        await self.ws.send(json.dumps(message))
-        
-    async def receive(self) -> AsyncGenerator[Dict[str, Any], None]:
-        """Receive messages from WebSocket with auto-reconnection"""
-        while not self._stop:
-            try:
-                if not self.is_connected:
-                    await self.connect()
-                    
-                async for message in self.ws:
-                    try:
-                        data = json.loads(message)
-                        yield data
-                    except json.JSONDecodeError:
-                        logger.error(f"Invalid JSON from WebSocket: {message}")
-                        continue
-                        
-            except websockets.exceptions.ConnectionClosed:
-                logger.warning("WebSocket connection closed, reconnecting...")
-                self.is_connected = False
-                await self._handle_reconnect()
-                
-            except Exception as e:
-                logger.error(f"WebSocket error: {e}")
-                self.is_connected = False
-                await self._handle_reconnect()
-                
-    async def _handle_reconnect(self) -> None:
-        """Handle reconnection with exponential backoff"""
-        if self._stop:
-            return
-            
-        await asyncio.sleep(self.reconnect_delay)
-        self.reconnect_delay = min(self.reconnect_delay * 2, self.max_reconnect_delay)
-        
-        try:
-            await self.connect()
-        except Exception as e:
-            logger.error(f"Reconnection failed: {e}")
-            
-
-class OrderBookManager:
-    """
-    Manages order book updates and maintains current state
-    """
-    
-    def __init__(self, symbol: str):
-        self.symbol = symbol
-        self.bids: Dict[Decimal, Decimal] = {}
-        self.asks: Dict[Decimal, Decimal] = {}
-        self.last_update_id: Optional[int] = None
-        self.snapshot_received = False
-        
-    def update_snapshot(self, bids: List[List], asks: List[List], update_id: Optional[int] = None) -> None:
-        """Update order book with snapshot data"""
-        self.bids.clear()
-        self.asks.clear()
-        
-        for bid in bids:
-            price = Decimal(str(bid[0]))
-            quantity = Decimal(str(bid[1]))
-            if quantity > 0:
-                self.bids[price] = quantity
-                
-        for ask in asks:
-            price = Decimal(str(ask[0]))
-            quantity = Decimal(str(ask[1]))
-            if quantity > 0:
-                self.asks[price] = quantity
-                
-        self.last_update_id = update_id
-        self.snapshot_received = True
-        
-    def update_delta(self, bids: List[List], asks: List[List], update_id: Optional[int] = None) -> None:
-        """Update order book with delta updates"""
-        if not self.snapshot_received:
-            return
-            
-        # Skip old updates
-        if update_id and self.last_update_id and update_id <= self.last_update_id:
-            return
-            
-        # Update bids
-        for bid in bids:
-            price = Decimal(str(bid[0]))
-            quantity = Decimal(str(bid[1]))
-            
-            if quantity == 0:
-                self.bids.pop(price, None)
-            else:
-                self.bids[price] = quantity
-                
-        # Update asks
-        for ask in asks:
-            price = Decimal(str(ask[0]))
-            quantity = Decimal(str(ask[1]))
-            
-            if quantity == 0:
-                self.asks.pop(price, None)
-            else:
-                self.asks[price] = quantity
-                
-        self.last_update_id = update_id
-        
-    def get_order_book(self, limit: int = 100) -> OrderBook:
-        """Get current order book state"""
-        # Sort and limit order book
-        sorted_bids = sorted(self.bids.items(), key=lambda x: x[0], reverse=True)[:limit]
-        sorted_asks = sorted(self.asks.items(), key=lambda x: x[0])[:limit]
-        
-        return OrderBook(
-            timestamp=datetime.now(timezone.utc),
-            symbol=self.symbol,
-            bids=sorted_bids,
-            asks=sorted_asks
+        # Create HTTP session
+        self.session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=self.config.timeout),
+            connector=aiohttp.TCPConnector(limit=100)
         )
         
-    def get_best_bid(self) -> Optional[Tuple[Decimal, Decimal]]:
-        """Get best bid price and quantity"""
-        if not self.bids:
-            return None
-        price = max(self.bids.keys())
-        return price, self.bids[price]
+        # Create WebSocket session if supported
+        if self.config.supports_websocket:
+            self.ws_session = aiohttp.ClientSession()
         
-    def get_best_ask(self) -> Optional[Tuple[Decimal, Decimal]]:
-        """Get best ask price and quantity"""
-        if not self.asks:
-            return None
-        price = min(self.asks.keys())
-        return price, self.asks[price]
+        # Exchange-specific initialization
+        await self._initialize_exchange()
         
-    def get_mid_price(self) -> Optional[Decimal]:
-        """Get mid price between best bid and ask"""
-        best_bid = self.get_best_bid()
-        best_ask = self.get_best_ask()
+        # Load market info
+        await self._load_markets()
         
-        if not best_bid or not best_ask:
-            return None
-            
-        return (best_bid[0] + best_ask[0]) / Decimal("2")
+        self.is_initialized = True
+        logger.info(f"{self.__class__.__name__} initialized successfully")
+    
+    async def shutdown(self):
+        """Shutdown exchange connection"""
+        self.is_initialized = False
+        self.is_connected = False
+        
+        # Close WebSocket
+        if self.ws_connection:
+            await self.ws_connection.close()
+        
+        # Close sessions
+        if self.session:
+            await self.session.close()
+        if self.ws_session:
+            await self.ws_session.close()
+        
+        logger.info(f"{self.__class__.__name__} shut down")
+    
+    async def check_connection(self) -> bool:
+        """Check if exchange is reachable"""
+        try:
+            # Simple ping or time endpoint
+            await self._check_connection()
+            self.is_connected = True
+            return True
+        except Exception as e:
+            logger.error(f"Connection check failed: {str(e)}")
+            self.is_connected = False
+            return False
+    
+    # Rate limiting
+    async def _rate_limit(self):
+        """Enforce rate limits"""
+        current_time = time.time()
+        
+        # Per-second rate limit
+        time_since_last = current_time - self.last_request_time
+        if time_since_last < 1.0 / self.config.rate_limit_per_second:
+            await asyncio.sleep(1.0 / self.config.rate_limit_per_second - time_since_last)
+        
+        # Per-minute rate limit
+        if current_time - self.minute_start_time >= 60:
+            self.minute_request_count = 0
+            self.minute_start_time = current_time
+        
+        if self.minute_request_count >= self.config.rate_limit_per_minute:
+            sleep_time = 60 - (current_time - self.minute_start_time)
+            if sleep_time > 0:
+                logger.warning(f"Rate limit reached, sleeping for {sleep_time:.1f}s")
+                await asyncio.sleep(sleep_time)
+                self.minute_request_count = 0
+                self.minute_start_time = time.time()
+        
+        self.last_request_time = time.time()
+        self.request_count += 1
+        self.minute_request_count += 1
+    
+    # HTTP methods
+    async def _request(
+        self,
+        method: str,
+        endpoint: str,
+        params: Optional[Dict] = None,
+        data: Optional[Dict] = None,
+        headers: Optional[Dict] = None,
+        signed: bool = False
+    ) -> Dict[str, Any]:
+        """Make HTTP request with retries"""
+        await self._rate_limit()
+        
+        url = f"{self.config.rest_url}{endpoint}"
+        
+        # Add authentication if needed
+        if signed:
+            headers = headers or {}
+            auth_headers = await self._get_auth_headers(method, endpoint, params, data)
+            headers.update(auth_headers)
+        
+        # Retry logic
+        for attempt in range(self.config.max_retries):
+            try:
+                async with self.session.request(
+                    method=method,
+                    url=url,
+                    params=params,
+                    json=data,
+                    headers=headers
+                ) as response:
+                    response_data = await response.json()
+                    
+                    if response.status >= 400:
+                        error_msg = response_data.get('msg', 'Unknown error')
+                        raise Exception(f"API error {response.status}: {error_msg}")
+                    
+                    return response_data
+                    
+            except Exception as e:
+                if attempt == self.config.max_retries - 1:
+                    logger.error(f"Request failed after {self.config.max_retries} attempts: {str(e)}")
+                    raise
+                
+                await asyncio.sleep(self.config.retry_delay * (attempt + 1))
+    
+    async def _get(self, endpoint: str, params: Optional[Dict] = None, signed: bool = False) -> Dict:
+        """GET request"""
+        return await self._request("GET", endpoint, params=params, signed=signed)
+    
+    async def _post(self, endpoint: str, data: Optional[Dict] = None, signed: bool = False) -> Dict:
+        """POST request"""
+        return await self._request("POST", endpoint, data=data, signed=signed)
+    
+    async def _delete(self, endpoint: str, params: Optional[Dict] = None, signed: bool = False) -> Dict:
+        """DELETE request"""
+        return await self._request("DELETE", endpoint, params=params, signed=signed)
+    
+    # Abstract methods that must be implemented by each exchange
+    @abstractmethod
+    async def _initialize_exchange(self):
+        """Exchange-specific initialization"""
+        pass
+    
+    @abstractmethod
+    async def _load_markets(self):
+        """Load market information"""
+        pass
+    
+    @abstractmethod
+    async def _check_connection(self):
+        """Exchange-specific connection check"""
+        pass
+    
+    @abstractmethod
+    async def _get_auth_headers(
+        self,
+        method: str,
+        endpoint: str,
+        params: Optional[Dict],
+        data: Optional[Dict]
+    ) -> Dict[str, str]:
+        """Generate authentication headers"""
+        pass
+    
+    # Trading methods
+    @abstractmethod
+    async def place_order(
+        self,
+        symbol: str,
+        side: str,
+        order_type: OrderType,
+        size: float,
+        price: Optional[float] = None,
+        params: Optional[Dict] = None
+    ) -> Order:
+        """Place an order"""
+        pass
+    
+    @abstractmethod
+    async def cancel_order(self, order_id: str, symbol: Optional[str] = None) -> bool:
+        """Cancel an order"""
+        pass
+    
+    @abstractmethod
+    async def get_order(self, order_id: str, symbol: Optional[str] = None) -> Order:
+        """Get order details"""
+        pass
+    
+    @abstractmethod
+    async def get_open_orders(self, symbol: Optional[str] = None) -> List[Order]:
+        """Get all open orders"""
+        pass
+    
+    @abstractmethod
+    async def get_order_history(
+        self,
+        symbol: Optional[str] = None,
+        limit: int = 100,
+        start_time: Optional[datetime] = None
+    ) -> List[Order]:
+        """Get order history"""
+        pass
+    
+    # Market data methods
+    @abstractmethod
+    async def get_ticker(self, symbol: str) -> Ticker:
+        """Get ticker for a symbol"""
+        pass
+    
+    @abstractmethod
+    async def get_order_book(self, symbol: str, limit: int = 20) -> OrderBook:
+        """Get order book"""
+        pass
+    
+    @abstractmethod
+    async def get_candles(
+        self,
+        symbol: str,
+        timeframe: str,
+        limit: int = 100,
+        start_time: Optional[datetime] = None
+    ) -> List[Candle]:
+        """Get candlestick data"""
+        pass
+    
+    @abstractmethod
+    async def get_trades(self, symbol: str, limit: int = 100) -> List[Trade]:
+        """Get recent trades"""
+        pass
+    
+    # Account methods
+    @abstractmethod
+    async def get_balance(self) -> Dict[str, Balance]:
+        """Get account balance"""
+        pass
+    
+    @abstractmethod
+    async def get_open_positions(self) -> List[Position]:
+        """Get open positions (for futures)"""
+        pass
+    
+    @abstractmethod
+    async def get_position(self, symbol: str) -> Optional[Position]:
+        """Get specific position"""
+        pass
+    
+    # WebSocket methods
+    async def start_websocket(
+        self,
+        on_message: Callable,
+        on_error: Optional[Callable] = None,
+        on_close: Optional[Callable] = None
+    ):
+        """Start WebSocket connection"""
+        if not self.config.supports_websocket:
+            raise NotImplementedError(f"{self.__class__.__name__} does not support WebSocket")
+        
+        self.ws_on_message = on_message
+        self.ws_on_error = on_error or self._default_error_handler
+        self.ws_on_close = on_close or self._default_close_handler
+        
+        await self._connect_websocket()
+        return self.ws_connection
+    
+    @abstractmethod
+    async def _connect_websocket(self):
+        """Connect to WebSocket"""
+        pass
+    
+    @abstractmethod
+    async def subscribe_ticker(self, symbol: str):
+        """Subscribe to ticker updates"""
+        pass
+    
+    @abstractmethod
+    async def subscribe_orderbook(self, symbol: str, depth: int = 20):
+        """Subscribe to order book updates"""
+        pass
+    
+    @abstractmethod
+    async def subscribe_trades(self, symbol: str):
+        """Subscribe to trade updates"""
+        pass
+    
+    @abstractmethod
+    async def subscribe_user_orders(self):
+        """Subscribe to user order updates"""
+        pass
+    
+    @abstractmethod
+    async def subscribe_user_positions(self):
+        """Subscribe to user position updates"""
+        pass
+    
+    # Helper methods
+    def _normalize_symbol(self, symbol: str) -> str:
+        """Normalize symbol format for the exchange"""
+        # Default implementation, override if needed
+        return symbol.replace('/', '').upper()
+    
+    def _denormalize_symbol(self, exchange_symbol: str) -> str:
+        """Convert exchange symbol to standard format"""
+        # Default implementation, override if needed
+        # Assumes format like BTCUSDT -> BTC/USDT
+        if len(exchange_symbol) >= 6:
+            # Try common patterns
+            for i in [3, 4]:  # BTC/USDT or DOGE/USDT
+                base = exchange_symbol[:i]
+                quote = exchange_symbol[i:]
+                if quote in ['USDT', 'USDC', 'BUSD', 'USD', 'BTC', 'ETH']:
+                    return f"{base}/{quote}"
+        return exchange_symbol
+    
+    def _parse_order_status(self, status: str) -> OrderStatus:
+        """Parse exchange-specific status to standard OrderStatus"""
+        # Default mapping, override for specific exchanges
+        status_map = {
+            'new': OrderStatus.OPEN,
+            'open': OrderStatus.OPEN,
+            'partially_filled': OrderStatus.PARTIALLY_FILLED,
+            'filled': OrderStatus.FILLED,
+            'canceled': OrderStatus.CANCELLED,
+            'cancelled': OrderStatus.CANCELLED,
+            'rejected': OrderStatus.REJECTED,
+            'expired': OrderStatus.EXPIRED
+        }
+        return status_map.get(status.lower(), OrderStatus.OPEN)
+    
+    def _parse_order_type(self, order_type: str) -> OrderType:
+        """Parse exchange-specific order type to standard OrderType"""
+        type_map = {
+            'market': OrderType.MARKET,
+            'limit': OrderType.LIMIT,
+            'stop': OrderType.STOP,
+            'stop_limit': OrderType.STOP_LIMIT,
+            'limit_maker': OrderType.POST_ONLY
+        }
+        return type_map.get(order_type.lower(), OrderType.LIMIT)
+    
+    def _parse_order_side(self, side: str) -> OrderSide:
+        """Parse order side"""
+        return OrderSide.BUY if side.lower() == 'buy' else OrderSide.SELL
+    
+    async def _default_error_handler(self, error: Exception):
+        """Default WebSocket error handler"""
+        logger.error(f"WebSocket error: {str(error)}")
+        if self.error_callback:
+            await self.error_callback(error)
+    
+    async def _default_close_handler(self):
+        """Default WebSocket close handler"""
+        logger.warning("WebSocket connection closed")
+        self.is_connected = False
+    
+    async def get_top_symbols(self, limit: int = 50) -> List[str]:
+        """Get top trading symbols by volume"""
+        # Default implementation - override for specific exchanges
+        tickers = await self.get_all_tickers()
+        
+        # Sort by 24h volume
+        sorted_tickers = sorted(
+            tickers.items(),
+            key=lambda x: x[1].quote_volume_24h,
+            reverse=True
+        )
+        
+        return [symbol for symbol, _ in sorted_tickers[:limit]]
+    
+    @abstractmethod
+    async def get_all_tickers(self) -> Dict[str, Ticker]:
+        """Get all tickers"""
+        pass
+    
+    def calculate_order_value(self, order: Order) -> float:
+        """Calculate total order value"""
+        if order.average_price:
+            return order.filled_size * order.average_price
+        elif order.price:
+            return order.size * order.price
+        return 0.0
+    
+    def calculate_pnl(self, position: Position) -> float:
+        """Calculate position PnL"""
+        return position.unrealized_pnl + position.realized_pnl
+    
+    def calculate_position_value(self, position: Position) -> float:
+        """Calculate position value"""
+        return position.size * position.mark_price

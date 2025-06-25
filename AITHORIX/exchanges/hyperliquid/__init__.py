@@ -1,5 +1,7 @@
-"""Hyperliquid exchange module"""
+"""
+AITHORIX Hyperliquid Exchange Module
+"""
 
-from .client import HyperliquidExchange
+from .client import HyperliquidClient
 
-__all__ = ["HyperliquidExchange"]
+__all__ = ['HyperliquidClient']
