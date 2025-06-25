@@ -1,406 +1,377 @@
-#!/usr/bin/env python3
 """
-AITHORIX Main Entry Point
-Advanced Trading Intelligence System
-
-This is the main entry point for the AITHORIX trading system.
-It initializes all components, starts the trading engine, and manages the system lifecycle.
-
-Usage:
-    python main.py [--config CONFIG_PATH] [--mode {production|development|testing}]
+AITHORIX Core Trading System
+Main entry point and application orchestration
 """
 
-import os
-import sys
-import signal
 import asyncio
-import logging
-import argparse
-from typing import Optional, Dict, Any
-from datetime import datetime
+import signal
+import sys
 import uvloop
-import multiprocessing as mp
-from pathlib import Path
+from contextlib import asynccontextmanager
+from typing import Optional
 
-# Add project root to Python path
-sys.path.insert(0, str(Path(__file__).parent.parent))
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from prometheus_fastapi_instrumentator import Instrumentator
+from starlette.middleware.sessions import SessionMiddleware
+import structlog
 
-# Performance: Use uvloop for faster async operations
-asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-
-# Import core components
-from core.engine.trading_engine import TradingEngine
-from core.engine.market_data import MarketDataEngine
-from core.engine.risk_engine import RiskEngine
-from core.engine.execution_engine import ExecutionEngine
+from core.api.rest_api import api_router
+from core.auth.middleware import AuthenticationMiddleware, RateLimitMiddleware
 from core.coordinator.strategy_coordinator import StrategyCoordinator
 from core.coordinator.model_coordinator import ModelCoordinator
 from core.coordinator.exchange_coordinator import ExchangeCoordinator
-from core.api.rest_api import create_app
+from core.database.connection import DatabaseManager
+from core.cache.redis_manager import RedisManager
+from core.engine.trading_engine import TradingEngine
 from core.websocket.ws_server import WebSocketServer
-from monitoring.health import HealthMonitor
-from utils.helpers import load_config, setup_logging, get_version_info
+from core.monitoring.metrics import MetricsCollector
+from core.monitoring.health import HealthChecker
+from core.config import settings
+from core.constants import APP_NAME, APP_VERSION
+from core.exceptions import handle_exceptions
+from core.logging_config import setup_logging
 
-# Global variables for graceful shutdown
-trading_engine: Optional[TradingEngine] = None
-shutdown_event = asyncio.Event()
+# Configure structured logging
+logger = structlog.get_logger(__name__)
+
+# Use uvloop for better async performance
+asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 
-class AITHORIXSystem:
-    """Main system orchestrator for AITHORIX trading platform"""
+class AITHORIXApplication:
+    """Main application class for AITHORIX trading system"""
     
-    def __init__(self, config_path: str, mode: str = "production"):
-        self.config_path = config_path
-        self.mode = mode
-        self.config = load_config(config_path)
-        self.logger = logging.getLogger("AITHORIX.Main")
-        
-        # Core components
+    def __init__(self):
+        self.app: Optional[FastAPI] = None
         self.trading_engine: Optional[TradingEngine] = None
-        self.market_data_engine: Optional[MarketDataEngine] = None
-        self.risk_engine: Optional[RiskEngine] = None
-        self.execution_engine: Optional[ExecutionEngine] = None
-        
-        # Coordinators
+        self.ws_server: Optional[WebSocketServer] = None
+        self.db_manager: Optional[DatabaseManager] = None
+        self.redis_manager: Optional[RedisManager] = None
+        self.metrics_collector: Optional[MetricsCollector] = None
+        self.health_checker: Optional[HealthChecker] = None
         self.strategy_coordinator: Optional[StrategyCoordinator] = None
         self.model_coordinator: Optional[ModelCoordinator] = None
         self.exchange_coordinator: Optional[ExchangeCoordinator] = None
+        self._shutdown_event = asyncio.Event()
         
-        # Services
-        self.api_server: Optional[Any] = None
-        self.ws_server: Optional[WebSocketServer] = None
-        self.health_monitor: Optional[HealthMonitor] = None
-        
-        # System state
-        self.is_running = False
-        self.start_time: Optional[datetime] = None
-        
-    async def initialize(self) -> None:
+    async def startup(self):
         """Initialize all system components"""
-        self.logger.info(f"Initializing AITHORIX System in {self.mode} mode...")
+        logger.info("Starting AITHORIX Trading System", version=APP_VERSION)
         
         try:
-            # Initialize market data engine first (needed by others)
-            self.logger.info("Initializing Market Data Engine...")
-            self.market_data_engine = MarketDataEngine(self.config["market_data"])
-            await self.market_data_engine.initialize()
+            # Initialize database connections
+            self.db_manager = DatabaseManager()
+            await self.db_manager.initialize()
+            logger.info("Database initialized")
             
-            # Initialize risk engine
-            self.logger.info("Initializing Risk Engine...")
-            self.risk_engine = RiskEngine(self.config["risk"])
-            await self.risk_engine.initialize()
+            # Initialize Redis cache
+            self.redis_manager = RedisManager()
+            await self.redis_manager.initialize()
+            logger.info("Redis cache initialized")
             
-            # Initialize execution engine
-            self.logger.info("Initializing Execution Engine...")
-            self.execution_engine = ExecutionEngine(self.config["execution"])
-            await self.execution_engine.initialize()
+            # Initialize metrics collector
+            self.metrics_collector = MetricsCollector()
+            await self.metrics_collector.initialize()
+            logger.info("Metrics collector initialized")
+            
+            # Initialize health checker
+            self.health_checker = HealthChecker(
+                db_manager=self.db_manager,
+                redis_manager=self.redis_manager
+            )
+            logger.info("Health checker initialized")
             
             # Initialize coordinators
-            self.logger.info("Initializing Exchange Coordinator...")
-            self.exchange_coordinator = ExchangeCoordinator(self.config["exchanges"])
+            self.exchange_coordinator = ExchangeCoordinator(
+                redis_manager=self.redis_manager
+            )
             await self.exchange_coordinator.initialize()
+            logger.info("Exchange coordinator initialized")
             
-            self.logger.info("Initializing Model Coordinator...")
-            self.model_coordinator = ModelCoordinator(self.config["models"])
+            self.model_coordinator = ModelCoordinator(
+                redis_manager=self.redis_manager,
+                metrics_collector=self.metrics_collector
+            )
             await self.model_coordinator.initialize()
+            logger.info("Model coordinator initialized with 175 models")
             
-            self.logger.info("Initializing Strategy Coordinator...")
             self.strategy_coordinator = StrategyCoordinator(
-                self.config["strategies"],
-                self.model_coordinator,
-                self.exchange_coordinator
+                model_coordinator=self.model_coordinator,
+                exchange_coordinator=self.exchange_coordinator,
+                metrics_collector=self.metrics_collector
             )
             await self.strategy_coordinator.initialize()
+            logger.info("Strategy coordinator initialized")
             
-            # Initialize trading engine with all components
-            self.logger.info("Initializing Trading Engine...")
+            # Initialize trading engine
             self.trading_engine = TradingEngine(
-                config=self.config["trading_engine"],
-                market_data_engine=self.market_data_engine,
-                risk_engine=self.risk_engine,
-                execution_engine=self.execution_engine,
                 strategy_coordinator=self.strategy_coordinator,
-                model_coordinator=self.model_coordinator,
-                exchange_coordinator=self.exchange_coordinator
+                exchange_coordinator=self.exchange_coordinator,
+                db_manager=self.db_manager,
+                redis_manager=self.redis_manager,
+                metrics_collector=self.metrics_collector
             )
             await self.trading_engine.initialize()
-            
-            # Initialize API server
-            self.logger.info("Initializing API Server...")
-            self.api_server = create_app(self.trading_engine, self.config["api"])
+            logger.info("Trading engine initialized")
             
             # Initialize WebSocket server
-            self.logger.info("Initializing WebSocket Server...")
             self.ws_server = WebSocketServer(
-                self.trading_engine,
-                self.config["websocket"]
+                trading_engine=self.trading_engine,
+                redis_manager=self.redis_manager
             )
             await self.ws_server.initialize()
+            logger.info("WebSocket server initialized")
             
-            # Initialize health monitoring
-            self.logger.info("Initializing Health Monitor...")
-            self.health_monitor = HealthMonitor(self)
-            await self.health_monitor.initialize()
+            # Start background tasks
+            asyncio.create_task(self.trading_engine.run())
+            asyncio.create_task(self.metrics_collector.run())
+            asyncio.create_task(self.health_checker.run())
+            asyncio.create_task(self.ws_server.run())
             
-            # Set global reference for signal handlers
-            global trading_engine
-            trading_engine = self.trading_engine
-            
-            self.logger.info("AITHORIX System initialization complete!")
-            
-        except Exception as e:
-            self.logger.error(f"Failed to initialize system: {e}", exc_info=True)
-            raise
-    
-    async def start(self) -> None:
-        """Start all system components"""
-        self.logger.info("Starting AITHORIX System...")
-        self.start_time = datetime.utcnow()
-        
-        try:
-            # Start market data feeds
-            await self.market_data_engine.start()
-            
-            # Start exchange connections
-            await self.exchange_coordinator.connect_all()
-            
-            # Load and validate ML models
-            await self.model_coordinator.load_all_models()
-            
-            # Start risk monitoring
-            await self.risk_engine.start()
-            
-            # Start strategy execution
-            await self.strategy_coordinator.start()
-            
-            # Start trading engine
-            await self.trading_engine.start()
-            
-            # Start API server in separate process
-            api_process = mp.Process(
-                target=self._run_api_server,
-                args=(self.config["api"]["host"], self.config["api"]["port"])
+            logger.info(
+                "AITHORIX Trading System started successfully",
+                exchanges=len(self.exchange_coordinator.exchanges),
+                models=len(self.model_coordinator.models),
+                strategies=len(self.strategy_coordinator.strategies)
             )
-            api_process.start()
-            
-            # Start WebSocket server
-            await self.ws_server.start()
-            
-            # Start health monitoring
-            await self.health_monitor.start()
-            
-            self.is_running = True
-            self.logger.info("AITHORIX System started successfully!")
-            
-            # Log system info
-            version_info = get_version_info()
-            self.logger.info(f"System Version: {version_info['version']}")
-            self.logger.info(f"Trading Mode: {self.mode}")
-            self.logger.info(f"Active Exchanges: {list(self.config['exchanges'].keys())}")
-            self.logger.info(f"Active Models: {self.model_coordinator.get_active_model_count()}")
-            self.logger.info(f"Active Strategies: {self.strategy_coordinator.get_active_strategy_count()}")
             
         except Exception as e:
-            self.logger.error(f"Failed to start system: {e}", exc_info=True)
+            logger.error("Failed to start AITHORIX", error=str(e), exc_info=True)
             await self.shutdown()
             raise
     
-    async def run(self) -> None:
-        """Main run loop"""
-        await self.initialize()
-        await self.start()
+    async def shutdown(self):
+        """Gracefully shutdown all system components"""
+        logger.info("Shutting down AITHORIX Trading System")
         
-        # Wait for shutdown signal
-        await shutdown_event.wait()
+        # Signal shutdown to all components
+        self._shutdown_event.set()
         
-        await self.shutdown()
+        # Shutdown in reverse order of initialization
+        shutdown_tasks = []
+        
+        if self.ws_server:
+            shutdown_tasks.append(self.ws_server.shutdown())
+            
+        if self.trading_engine:
+            shutdown_tasks.append(self.trading_engine.shutdown())
+            
+        if self.strategy_coordinator:
+            shutdown_tasks.append(self.strategy_coordinator.shutdown())
+            
+        if self.model_coordinator:
+            shutdown_tasks.append(self.model_coordinator.shutdown())
+            
+        if self.exchange_coordinator:
+            shutdown_tasks.append(self.exchange_coordinator.shutdown())
+            
+        if self.metrics_collector:
+            shutdown_tasks.append(self.metrics_collector.shutdown())
+            
+        if self.health_checker:
+            shutdown_tasks.append(self.health_checker.shutdown())
+            
+        if self.redis_manager:
+            shutdown_tasks.append(self.redis_manager.close())
+            
+        if self.db_manager:
+            shutdown_tasks.append(self.db_manager.close())
+        
+        # Wait for all shutdowns to complete
+        if shutdown_tasks:
+            await asyncio.gather(*shutdown_tasks, return_exceptions=True)
+        
+        logger.info("AITHORIX Trading System shutdown complete")
     
-    async def shutdown(self) -> None:
-        """Gracefully shutdown all components"""
-        self.logger.info("Initiating graceful shutdown...")
-        self.is_running = False
+    def create_app(self) -> FastAPI:
+        """Create FastAPI application with all middleware and routes"""
         
-        try:
-            # Stop accepting new trades
-            if self.trading_engine:
-                await self.trading_engine.stop_new_trades()
-            
-            # Close all positions if in emergency mode
-            if self.mode == "emergency":
-                self.logger.warning("Emergency shutdown - closing all positions...")
-                if self.trading_engine:
-                    await self.trading_engine.close_all_positions()
-            
-            # Stop components in reverse order
-            if self.health_monitor:
-                await self.health_monitor.stop()
-                
-            if self.ws_server:
-                await self.ws_server.stop()
-                
-            if self.trading_engine:
-                await self.trading_engine.stop()
-                
-            if self.strategy_coordinator:
-                await self.strategy_coordinator.stop()
-                
-            if self.risk_engine:
-                await self.risk_engine.stop()
-                
-            if self.exchange_coordinator:
-                await self.exchange_coordinator.disconnect_all()
-                
-            if self.market_data_engine:
-                await self.market_data_engine.stop()
-                
-            if self.model_coordinator:
-                await self.model_coordinator.cleanup()
-            
-            # Calculate uptime
-            if self.start_time:
-                uptime = datetime.utcnow() - self.start_time
-                self.logger.info(f"System uptime: {uptime}")
-            
-            self.logger.info("Graceful shutdown complete")
-            
-        except Exception as e:
-            self.logger.error(f"Error during shutdown: {e}", exc_info=True)
-    
-    def _run_api_server(self, host: str, port: int) -> None:
-        """Run API server in separate process"""
-        import uvicorn
-        uvicorn.run(
-            self.api_server,
-            host=host,
-            port=port,
-            log_level="info",
-            access_log=True
+        @asynccontextmanager
+        async def lifespan(app: FastAPI):
+            # Startup
+            await self.startup()
+            yield
+            # Shutdown
+            await self.shutdown()
+        
+        self.app = FastAPI(
+            title=APP_NAME,
+            version=APP_VERSION,
+            description="Advanced AI Trading System with 175 ML Models",
+            lifespan=lifespan,
+            docs_url="/api/docs" if settings.DEBUG else None,
+            redoc_url="/api/redoc" if settings.DEBUG else None,
+            openapi_url="/api/openapi.json" if settings.DEBUG else None,
         )
+        
+        # Add middleware
+        self._setup_middleware()
+        
+        # Add routes
+        self._setup_routes()
+        
+        # Setup instrumentation
+        self._setup_instrumentation()
+        
+        return self.app
     
-    def get_status(self) -> Dict[str, Any]:
-        """Get current system status"""
-        return {
-            "running": self.is_running,
-            "mode": self.mode,
-            "start_time": self.start_time.isoformat() if self.start_time else None,
-            "uptime": str(datetime.utcnow() - self.start_time) if self.start_time else None,
-            "components": {
-                "trading_engine": self.trading_engine.get_status() if self.trading_engine else "Not initialized",
-                "market_data": self.market_data_engine.get_status() if self.market_data_engine else "Not initialized",
-                "risk_engine": self.risk_engine.get_status() if self.risk_engine else "Not initialized",
-                "exchanges": self.exchange_coordinator.get_status() if self.exchange_coordinator else "Not initialized",
-                "models": self.model_coordinator.get_status() if self.model_coordinator else "Not initialized",
-                "strategies": self.strategy_coordinator.get_status() if self.strategy_coordinator else "Not initialized",
-            }
-        }
+    def _setup_middleware(self):
+        """Configure application middleware"""
+        
+        # CORS middleware
+        self.app.add_middleware(
+            CORSMiddleware,
+            allow_origins=settings.ALLOWED_ORIGINS,
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+            expose_headers=["X-Request-ID", "X-Process-Time"],
+        )
+        
+        # Trusted host middleware
+        self.app.add_middleware(
+            TrustedHostMiddleware,
+            allowed_hosts=settings.ALLOWED_HOSTS
+        )
+        
+        # GZip compression
+        self.app.add_middleware(
+            GZipMiddleware,
+            minimum_size=1000,
+            compresslevel=6
+        )
+        
+        # Session middleware
+        self.app.add_middleware(
+            SessionMiddleware,
+            secret_key=settings.SESSION_SECRET_KEY,
+            max_age=settings.SESSION_TIMEOUT,
+            same_site="lax",
+            https_only=not settings.DEBUG,
+        )
+        
+        # Custom authentication middleware
+        self.app.add_middleware(AuthenticationMiddleware)
+        
+        # Rate limiting middleware
+        self.app.add_middleware(
+            RateLimitMiddleware,
+            redis_manager=self.redis_manager
+        )
+        
+        # Exception handling
+        self.app.add_exception_handler(Exception, handle_exceptions)
+    
+    def _setup_routes(self):
+        """Configure API routes"""
+        
+        # Health check endpoints
+        @self.app.get("/health")
+        async def health_check():
+            return await self.health_checker.check_health()
+        
+        @self.app.get("/health/live")
+        async def liveness_check():
+            return {"status": "alive"}
+        
+        @self.app.get("/health/ready")
+        async def readiness_check():
+            return await self.health_checker.check_readiness()
+        
+        # Metrics endpoint
+        @self.app.get("/metrics")
+        async def metrics():
+            return await self.metrics_collector.get_prometheus_metrics()
+        
+        # Include API router
+        self.app.include_router(
+            api_router,
+            prefix="/api/v1"
+        )
+        
+        # WebSocket endpoint
+        self.app.websocket_route("/ws")(self.ws_server.websocket_endpoint)
+    
+    def _setup_instrumentation(self):
+        """Setup monitoring instrumentation"""
+        
+        # Prometheus instrumentation
+        instrumentator = Instrumentator(
+            should_group_status_codes=True,
+            should_ignore_untemplated=True,
+            should_group_untemplated=False,
+            should_round_latency_decimals=True,
+            excluded_handlers=["/metrics", "/health.*"],
+            inprogress_name="aithorix_inprogress",
+            inprogress_labels=True,
+        )
+        
+        instrumentator.instrument(self.app)
+        
+        # Custom metrics
+        @instrumentator.add()
+        async def add_custom_metrics(info: object):
+            """Add custom business metrics"""
+            if hasattr(info.response, "headers"):
+                process_time = info.response.headers.get("X-Process-Time")
+                if process_time:
+                    self.metrics_collector.observe_api_latency(
+                        info.request.url.path,
+                        float(process_time),
+                        info.response.status_code
+                    )
 
 
-def signal_handler(signum: int, frame: Any) -> None:
-    """Handle system signals for graceful shutdown"""
-    logger = logging.getLogger("AITHORIX.Main")
-    logger.info(f"Received signal {signum}")
-    
-    # Trigger shutdown
-    asyncio.create_task(shutdown_event.set())
+# Global application instance
+app_instance = AITHORIXApplication()
+app = app_instance.create_app()
 
 
-def parse_arguments() -> argparse.Namespace:
-    """Parse command line arguments"""
-    parser = argparse.ArgumentParser(
-        description="AITHORIX Advanced Trading Intelligence System"
-    )
+def handle_signals():
+    """Setup signal handlers for graceful shutdown"""
     
-    parser.add_argument(
-        "--config",
-        type=str,
-        default="config/production.yaml",
-        help="Path to configuration file"
-    )
+    def signal_handler(sig, frame):
+        logger.info(f"Received signal {sig}")
+        asyncio.create_task(app_instance.shutdown())
+        sys.exit(0)
     
-    parser.add_argument(
-        "--mode",
-        type=str,
-        choices=["production", "development", "testing", "emergency"],
-        default="production",
-        help="System mode"
-    )
-    
-    parser.add_argument(
-        "--log-level",
-        type=str,
-        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
-        default="INFO",
-        help="Logging level"
-    )
-    
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Run in dry-run mode (no real trades)"
-    )
-    
-    parser.add_argument(
-        "--version",
-        action="store_true",
-        help="Show version information"
-    )
-    
-    return parser.parse_args()
-
-
-async def main() -> None:
-    """Main entry point"""
-    args = parse_arguments()
-    
-    # Show version and exit if requested
-    if args.version:
-        version_info = get_version_info()
-        print(f"AITHORIX v{version_info['version']}")
-        print(f"Build: {version_info['build']}")
-        print(f"Python: {sys.version}")
-        return
-    
-    # Setup logging
-    setup_logging(args.log_level)
-    logger = logging.getLogger("AITHORIX.Main")
-    
-    # Log startup
-    logger.info("=" * 80)
-    logger.info("AITHORIX Advanced Trading Intelligence System")
-    logger.info(f"Version: {get_version_info()['version']}")
-    logger.info(f"Mode: {args.mode}")
-    logger.info(f"Config: {args.config}")
-    logger.info("=" * 80)
-    
-    # Register signal handlers
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
+
+
+def run_trading():
+    """Run the trading system (console script entry point)"""
+    import uvicorn
     
-    # Create and run system
-    try:
-        system = AITHORIXSystem(args.config, args.mode)
-        
-        # Override dry-run if specified
-        if args.dry_run:
-            logger.info("DRY-RUN MODE ENABLED - No real trades will be executed")
-            system.config["trading_engine"]["dry_run"] = True
-        
-        await system.run()
-        
-    except KeyboardInterrupt:
-        logger.info("Keyboard interrupt received")
-    except Exception as e:
-        logger.error(f"Fatal error: {e}", exc_info=True)
-        sys.exit(1)
+    # Setup logging
+    setup_logging()
+    
+    # Setup signal handlers
+    handle_signals()
+    
+    # Run the application
+    uvicorn.run(
+        "core.main:app",
+        host=settings.APP_HOST,
+        port=settings.APP_PORT,
+        workers=settings.APP_WORKERS if not settings.DEBUG else 1,
+        reload=settings.DEBUG,
+        access_log=settings.ENABLE_REQUEST_LOGGING,
+        log_config=None,  # Use our custom logging
+        server_header=False,
+        date_header=False,
+        limit_concurrency=1000,
+        limit_max_requests=10000,
+        timeout_keep_alive=5,
+        ssl_keyfile=settings.SSL_KEYFILE if settings.SSL_ENABLED else None,
+        ssl_certfile=settings.SSL_CERTFILE if settings.SSL_ENABLED else None,
+        ssl_version=settings.SSL_VERSION if settings.SSL_ENABLED else None,
+        ssl_ciphers=settings.SSL_CIPHERS if settings.SSL_ENABLED else None,
+    )
 
 
 if __name__ == "__main__":
-    # Set process title
-    try:
-        import setproctitle
-        setproctitle.setproctitle("aithorix-trading")
-    except ImportError:
-        pass
-    
-    # Run the system
-    asyncio.run(main())
+    run_trading()
